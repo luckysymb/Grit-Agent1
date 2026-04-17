@@ -203,7 +203,7 @@ export function createGrepSearchToolDefinition(cwd: string): ToolDefinition<type
 		name: "grep_search",
 		label: "grep_search",
 		description:
-			"Fast regex search over text files (ripgrep). Results capped at 1500 matches; optional `path` restricts to a subdirectory for thorough subtree sweeps. Run **separate** calls per symbol/string the task names and merge paths — one pattern rarely finds every callsite. Escape regex metacharacters for literals.",
+			"Fast regex search (ripgrep; capped at 1500 matches). Use optional `path` to sweep one subtree at a time. Run **separate** calls per important literal/symbol from the task; merge paths into your candidate list. When the host allows multiple tool calls per turn, batch independent greps in parallel. Escape regex metacharacters for literal strings.",
 		parameters: grepSearchSchema,
 		prepareArguments: prepareGrepSearchArguments,
 		async execute(

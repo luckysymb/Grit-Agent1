@@ -31,6 +31,8 @@ Full wording lives under **CRITICAL — Coverage protocol** in `packages/coding-
 
 Also read **`## Breadth and thoroughness`** in the same preamble: vary `grep`/`codebase_search` queries, `list_dir` source roots, and treat injected *LIKELY RELEVANT FILES* as a **hint, not a cap**.
 
+If the repo has **`packages/`** (monorepo), the injected block may include **MONOREPO** rules — follow them; server/core packages are often missed if you only edit one UI package.
+
 **Discovery floor (injected per task):** Expect **at least 4–8+** distinct discovery tool calls before the first edit (higher when there are many acceptance bullets or UI+API+tests). The task block may spell out the exact minimum and a **thoroughness** line — follow it.
 
 ---

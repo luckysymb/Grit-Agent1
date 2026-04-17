@@ -344,7 +344,7 @@ export function createCodebaseSearchToolDefinition(
 	return {
 		name: "codebase_search",
 		label: "codebase_search",
-		description: `Find relevant code via multi-round ripgrep + NLP keyword refinement (8 passes: search → read top-40 hit files per round → augment keywords loyal to query/explanation → repeat). Returns up to 180 ranked paths with line snippets, plus extra path-only overflow. Not an embedding index; respects .gitignore. Call multiple times with different natural-language queries and scopes — first pass often misses files; vary wording and target_directories.`,
+		description: `Multi-round keyword exploration (ripgrep + keyword expansion): complementary to grep_search — use for "how / where / what" questions, not only exact symbols. Returns ranked paths with snippets; ranking is not exhaustive. Call multiple times with different wording and target_directories (repo-wide [] plus scoped subtrees such as src/, app/, lib/, packages/*, tests). Merge results with grep hits; first pass often misses files.`,
 		parameters: codebaseSearchSchema,
 		prepareArguments: prepareCodebaseSearchArguments,
 		async execute(

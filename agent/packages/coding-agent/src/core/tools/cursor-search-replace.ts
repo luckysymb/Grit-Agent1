@@ -80,7 +80,7 @@ export function createSearchReplaceToolDefinition(cwd: string): ToolDefinition<t
 		name: "search_replace",
 		label: "search_replace",
 		description:
-			"Replace old_string with new_string in a file. Copy text from read_file; line-number columns from read_file are stripped. Exact match first, then fuzzy (quotes/whitespace/tabs). If old_string appears multiple times: replace_all replaces every occurrence; otherwise replace_first_match_only (default true) changes only the first match so the tool does not fail. Primary tool for editing existing files.",
+			"Replace old_string with new_string in a file. Copy text from read_file; line-number columns from read_file are stripped. Exact match first, then fuzzy (quotes/whitespace/tabs). If old_string appears multiple times: replace_all replaces every occurrence; otherwise replace_first_match_only (default true) changes only the first match so the tool does not fail. If old_string and new_string are identical after normalization, succeeds with no file change (not an error). Primary tool for editing existing files.",
 		parameters: searchReplaceSchema,
 		prepareArguments: prepareSearchReplaceArguments,
 		async execute(
@@ -99,9 +99,16 @@ export function createSearchReplaceToolDefinition(cwd: string): ToolDefinition<t
 			const oldStr = stripReadFileLineNumberPrefixes(normalizeToLF(args.old_string));
 			const newStr = stripReadFileLineNumberPrefixes(normalizeToLF(args.new_string));
 			if (oldStr === newStr) {
-				throw new Error(
-					"old_string and new_string are identical after normalization — change new_string or narrow old_string.",
-				);
+				// Not an error: model sometimes repeats a no-op; avoids wasting a turn on isError + retry churn.
+				return {
+					content: [
+						{
+							type: "text",
+							text: `No change needed for ${args.file_path}: old_string and new_string are identical after normalization (file unchanged).`,
+						},
+					],
+					details: undefined,
+				};
 			}
 			const replaceAll = args.replace_all === true;
 			// Default true via prepareArguments: duplicate blocks no longer hard-fail.

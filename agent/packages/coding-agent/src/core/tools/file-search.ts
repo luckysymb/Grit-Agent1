@@ -138,7 +138,7 @@ export function createFileSearchToolDefinition(cwd: string): ToolDefinition<type
 		name: "file_search",
 		label: "file_search",
 		description:
-			"Fuzzy search over file paths (substring / character-order score; multi-token queries boost paths matching several segments). Up to 160 results. Call once per important path segment from the task (package names, layer directories, filename stems) to enumerate plausible files before editing.",
+			"Fuzzy path search (substring / character-order score; multi-token queries boost matches). Up to 160 results. Run separate calls for each path-shaped token from the task (package segments, feature dirs, filename stems); union results with grep_search and codebase_search into one candidate list before editing.",
 		parameters: fileSearchSchema,
 		prepareArguments: prepareFileSearchArguments,
 		async execute(

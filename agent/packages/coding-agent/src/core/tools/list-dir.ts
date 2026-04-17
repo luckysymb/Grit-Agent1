@@ -55,7 +55,7 @@ export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof 
 		name: "list_dir",
 		label: "list_dir",
 		description:
-			"List the contents of a directory (non-dot entries; up to 5000 entries). Use for breadth-first discovery across packages before searching or reading files.",
+			"List directory contents (non-dot entries; up to 5000). Use early to map layout: list `.`, `src`, `app`, `packages`, test roots, and any subtree you have not explored yet. Repeat after you learn folder names — parallel trees (e.g. alternate apps or packages) are easy to miss without listing.",
 		parameters: listDirSchema,
 		prepareArguments: prepareListDirArguments,
 		async execute(
@@ -67,10 +67,17 @@ export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof 
 		) {
 			const abs = resolveReadPath(args.relative_workspace_path, cwd);
 			if (!existsSync(abs)) {
-				throw new Error(`Path not found: ${args.relative_workspace_path}`);
+				throw new Error(
+					`Path not found: ${args.relative_workspace_path}\n` +
+						`[R] Paths must exist relative to the workspace root — do not guess. ` +
+						`Run list_dir on "." or "packages" first, then descend using names you see.`,
+				);
 			}
 			if (!statSync(abs).isDirectory()) {
-				throw new Error(`Not a directory: ${args.relative_workspace_path}`);
+				throw new Error(
+					`Not a directory: ${args.relative_workspace_path}\n` +
+						`[R] Pass a directory path, or list "." to locate folders.`,
+				);
 			}
 
 			const entries = readdirSync(abs, { withFileTypes: true })
