@@ -20,9 +20,10 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "./truncate.js";
 
 const SEARCH_ROUNDS = 5;
-const TOP_FILES_TO_READ = 10;
+/** Files read per round to mine identifiers for keyword augmentation (full discovery). */
+const TOP_FILES_TO_READ = 24;
 /** Cap per high-hit file when mining tokens for augmentation (bytes). */
-const NLP_READ_BYTES = 64 * 1024;
+const NLP_READ_BYTES = 96 * 1024;
 
 const codebaseSearchSchema = Type.Object({
 	query: Type.String({
@@ -44,8 +45,9 @@ const codebaseSearchSchema = Type.Object({
 
 export type CodebaseSearchToolInput = Static<typeof codebaseSearchSchema>;
 
-const DEFAULT_FILE_LIMIT = 25;
-const SNIPPET_LINES = 4;
+/** Ranked paths returned (tau: missing implied file ⇒ 0 score — surface many candidates). */
+const DEFAULT_FILE_LIMIT = 100;
+const SNIPPET_LINES = 5;
 
 function escapeRgLiteral(s: string): string {
 	return s.replace(/[\\.*+?^${}()|[\]\\]/g, "\\$&");
@@ -66,7 +68,7 @@ function dedupeKeywordsPreserveOrder(keywords: string[]): string[] {
 function buildInitialKeywordSet(query: string, explanation?: string): string[] {
 	const seeds = buildSeedKeywords(query, explanation);
 	const loyal = `${query}\n${explanation ?? ""}`;
-	const phrases = extractLoyalPhrases(loyal, 8);
+	const phrases = extractLoyalPhrases(loyal, 14);
 	const merged = dedupeKeywordsPreserveOrder([...seeds, ...phrases]);
 	return merged;
 }
@@ -212,7 +214,7 @@ export function createCodebaseSearchToolDefinition(
 	return {
 		name: "codebase_search",
 		label: "codebase_search",
-		description: `Find relevant code via multi-round ripgrep + NLP keyword refinement (5 passes: search → read top-10 hit files → augment keywords loyal to query/explanation → repeat). Not an embedding index; respects .gitignore.`,
+		description: `Find relevant code via multi-round ripgrep + NLP keyword refinement (5 passes: search → read top-24 hit files → augment keywords loyal to query/explanation → repeat). Returns up to 100 ranked paths with line snippets. Not an embedding index; respects .gitignore.`,
 		parameters: codebaseSearchSchema,
 		async execute(
 			_toolCallId,
@@ -313,15 +315,18 @@ export function createCodebaseSearchToolDefinition(
 				};
 			}
 
-			const finalRanked = [...cumulativeHits.entries()].sort((a, b) => b[1] - a[1]).slice(0, fileLimit);
+			const sortedByHits = [...cumulativeHits.entries()].sort((a, b) => b[1] - a[1]);
+			const finalRanked = sortedByHits.slice(0, fileLimit);
+			const overflowPaths = sortedByHits.slice(fileLimit, fileLimit + 80);
 
 			const linesOut: string[] = [
-				`Multi-round codebase_search (${SEARCH_ROUNDS} passes, top ${TOP_FILES_TO_READ} files/read used for NLP augmentation between passes).`,
+				`Multi-round codebase_search (${SEARCH_ROUNDS} passes, top ${TOP_FILES_TO_READ} files/read per pass for NLP augmentation).`,
 				"Loyalty: augmented terms are weighted toward your query + explanation and co-occurring identifiers in high-hit lines.",
+				"Read every path below that could belong to the task — missing a relevant file loses line-level score.",
 				"",
 				...roundSummaries,
 				"",
-				`Final ranking by cumulative hits across rounds — top ${finalRanked.length} file(s):`,
+				`Final ranking by cumulative hits — top ${finalRanked.length} file(s) with snippets:`,
 				"",
 			];
 
@@ -334,6 +339,19 @@ export function createCodebaseSearchToolDefinition(
 					for (const s of sn) {
 						linesOut.push(`    ${s.line}: ${s.text}`);
 					}
+				}
+				linesOut.push("");
+			}
+
+			if (overflowPaths.length > 0) {
+				linesOut.push(
+					`Additional paths with hits (no snippets — still candidates to read): ${overflowPaths.length}`,
+					"",
+				);
+				for (const [abs, hits] of overflowPaths) {
+					let rel = path.relative(cwd, abs).replace(/\\/g, "/");
+					if (!rel || rel.startsWith("..")) rel = abs;
+					linesOut.push(`• ${rel} (${hits} cumulative hits)`);
 				}
 				linesOut.push("");
 			}

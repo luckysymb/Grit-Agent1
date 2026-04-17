@@ -1,19 +1,20 @@
 /**
- * `file_search` — fuzzy path match, max 10 results (tau/Cursor_Tools.json).
+ * `file_search` — fuzzy path match; many results for monorepo discovery (tau).
  */
+
+import { spawnSync } from "node:child_process";
+import path from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
 import { existsSync } from "fs";
-import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { ensureTool } from "../../utils/tools-manager.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { resolveToCwd } from "./path-utils.js";
 import { str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
-const MAX_RESULTS = 10;
+const MAX_RESULTS = 80;
 
 const fileSearchSchema = Type.Object({
 	query: Type.String({ description: "Fuzzy filename to search for" }),
@@ -24,9 +25,10 @@ const fileSearchSchema = Type.Object({
 
 export type FileSearchToolInput = Static<typeof fileSearchSchema>;
 
-function scorePath(rel: string, q: string): number {
+function scorePathSingle(rel: string, token: string): number {
 	const lower = rel.toLowerCase();
-	const qq = q.toLowerCase();
+	const qq = token.toLowerCase();
+	if (!qq.length) return 0;
 	if (lower.includes(qq)) return 100 + qq.length;
 	let s = 0;
 	for (const ch of qq) {
@@ -37,11 +39,37 @@ function scorePath(rel: string, q: string): number {
 	return 50;
 }
 
+/** Score path against full query and path segments (dashboard, sessionModel, etc.). */
+function scorePath(rel: string, q: string): number {
+	const trimmed = q.trim();
+	if (!trimmed) return 0;
+	const parts = trimmed
+		.split(/[/\\\s,_-]+/g)
+		.map((p) => p.trim())
+		.filter((p) => p.length >= 2);
+	if (parts.length <= 1) {
+		const one = scorePathSingle(rel, parts[0] ?? trimmed);
+		return one;
+	}
+	let sum = 0;
+	let ok = 0;
+	for (const p of parts) {
+		const sc = scorePathSingle(rel, p);
+		if (sc >= 0) {
+			sum += sc;
+			ok++;
+		}
+	}
+	if (ok === 0) return -1;
+	return sum / ok + (ok > 1 ? 25 : 0);
+}
+
 export function createFileSearchToolDefinition(cwd: string): ToolDefinition<typeof fileSearchSchema, undefined> {
 	return {
 		name: "file_search",
 		label: "file_search",
-		description: "Fuzzy search over file paths (substring / character-order score). At most 10 results.",
+		description:
+			"Fuzzy search over file paths (substring / character-order score; multi-token queries boost paths matching several segments). Up to 80 results.",
 		parameters: fileSearchSchema,
 		async execute(
 			_toolCallId,

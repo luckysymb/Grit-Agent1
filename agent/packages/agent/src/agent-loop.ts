@@ -149,6 +149,33 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+/** `read` (pi) and `read_file` (tau) both load a file into context. */
+function isReadLikeTool(name: string): boolean {
+	return name === "read" || name === "read_file";
+}
+
+/** Tools that only explore the repo — still need a follow-up `edit` to score. */
+function isDiscoveryTool(name: string): boolean {
+	return (
+		isReadLikeTool(name) ||
+		name === "bash" ||
+		name === "ls" ||
+		name === "list_dir" ||
+		name === "grep" ||
+		name === "grep_search" ||
+		name === "find" ||
+		name === "file_search" ||
+		name === "codebase_search"
+	);
+}
+
+function readPathFromToolCall(tc: AgentToolCall): string {
+	const a = tc.arguments as Record<string, unknown> | undefined;
+	if (!a) return "";
+	const p = a.path ?? a.target_file ?? a.file_path;
+	return typeof p === "string" ? p : "";
+}
+
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
@@ -175,7 +202,9 @@ async function runLoop(
 	let explorationCount = 0;
 	let hasProducedEdit = false;
 	let emptyTurnRetries = 0;
-	const EMPTY_TURN_MAX = 2;
+	const EMPTY_TURN_MAX = 7;
+	/** Last files successfully read (read / read_file); used when the model returns empty turns. */
+	let recentReadPaths: string[] = [];
 
 	const loopStart = Date.now();
 	let earlyNudgeSent = false;
@@ -327,6 +356,14 @@ async function runLoop(
 				const idleStopped = message.stopReason === "stop" && !hasProducedEdit;
 				if (tokenCapped || idleStopped) {
 					emptyTurnRetries++;
+					const primaryPath =
+						recentReadPaths[0] ||
+						(pathsAlreadyRead.size > 0 ? [...pathsAlreadyRead][0] : "") ||
+						(foundFiles[0] ?? "");
+					const concreteEditHint =
+						!tokenCapped && primaryPath
+							? ` Call \`edit\` on \`${primaryPath}\` now — use \`old_string\` copied verbatim from that file (or add a new file with \`write\` if required). Discovery-only turns score zero.`
+							: "";
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
@@ -334,8 +371,8 @@ async function runLoop(
 							{
 								type: "text",
 								text: tokenCapped
-									? "Output budget consumed without any tool invocation. Invoke \`read\` or \`edit\` now. Text output contributes nothing to your score."
-									: "No file modifications detected. A blank diff receives zero points. Use \`read\` on the primary file, then \`edit\` it immediately.",
+									? "Output budget consumed without any tool invocation. Invoke \`read\`/\`read_file\` or \`edit\` now. Text output contributes nothing to your score."
+									: `No file modifications detected. A blank diff receives zero points.${concreteEditHint} Do not reply with prose only — your next message must include an \`edit\` (or \`write\`) tool call.`,
 							},
 						],
 						timestamp: Date.now(),
@@ -364,6 +401,7 @@ async function runLoop(
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
 				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+				emptyTurnRetries = 0;
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
@@ -485,13 +523,13 @@ async function runLoop(
 						}
 					}
 				} else if (workPhase === "absorb") {
-					for (const tr of toolResults) {
-						if (tr.toolName === "read" && !tr.isError) {
-							const tc2 = toolCalls.find((c: any) => c.type === "toolCall" && c.name === "read");
-							if (tc2) {
-								const path = (tc2.arguments as any)?.path ?? "";
-								if (path) absorbedFiles.add(path);
-							}
+					for (let i = 0; i < toolResults.length; i++) {
+						const tr = toolResults[i];
+						const tc = toolCalls[i];
+						if (!tc || tc.type !== "toolCall") continue;
+						if (isReadLikeTool(tr.toolName) && !tr.isError) {
+							const path = readPathFromToolCall(tc);
+							if (path) absorbedFiles.add(path);
 						}
 						if (tr.toolName === "edit" && !tr.isError) {
 							workPhase = "apply";
@@ -511,14 +549,15 @@ async function runLoop(
 				for (let i = 0; i < toolResults.length; i++) {
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
-					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
+					if (isDiscoveryTool(tr.toolName) && !tr.isError) {
 						if (!hasProducedEdit) explorationCount++;
 					}
-					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
-						const readPath = (tc.arguments as any)?.path;
-						if (readPath && typeof readPath === "string") {
+					if (isReadLikeTool(tr.toolName) && !tr.isError && tc && tc.type === "toolCall") {
+						const readPath = readPathFromToolCall(tc);
+						if (readPath) {
 							pathsAlreadyRead.add(readPath);
 							pathReadCounts.set(readPath, (pathReadCounts.get(readPath) ?? 0) + 1);
+							recentReadPaths = [readPath, ...recentReadPaths.filter((p) => p !== readPath)].slice(0, 5);
 						}
 					}
 				}
@@ -562,82 +601,84 @@ async function runLoop(
 					});
 					explorationCount = 0;
 				}
+			}
 
-				if (!hasProducedEdit && pendingMessages.length === 0) {
-					const elapsed = Date.now() - loopStart;
-					const readList = pathsAlreadyRead.size > 0
-						? `Previously read: ${[...pathsAlreadyRead].slice(0, 5).join(", ")}. `
-						: "";
-					if (!earlyNudgeSent && elapsed >= EARLY_NUDGE_MS) {
-						earlyNudgeSent = true;
-						pendingMessages.push({
-							role: "user",
-							content: [
-								{
-									type: "text",
-									text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`edit\` to the most relevant file now. Even one correct change contributes to your score.`,
-								},
-							],
-							timestamp: Date.now(),
-						});
-					} else if (earlyNudgeSent && elapsed >= URGENT_NUDGE_MS && !urgentNudgeSent) {
-						urgentNudgeSent = true;
-						pendingMessages.push({
-							role: "user",
-							content: [
-								{
-									type: "text",
-									text: `${Math.round(elapsed/1000)}s in with zero file modifications. Time may be running out. ${readList}Make an edit immediately or accept a zero score.`,
-								},
-							],
-							timestamp: Date.now(),
-						});
-					}
-				}
-
-				if (hasProducedEdit && pendingMessages.length === 0) {
-					const elapsed = Date.now() - loopStart;
-					const uniqueEdited = new Set([...editedPaths].map(p => p.replace(/^\.\//, "")));
-					const uneditedFound = foundFiles.filter((f: string) => {
-						const nf = f.replace(/^\.\//, "");
-						return !uniqueEdited.has(nf);
-					});
-					if (uneditedFound.length > 0 && elapsed > 30_000 && uniqueEdited.size <= 2) {
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `30s+ elapsed and you have only edited ${uniqueEdited.size} file(s). ${uneditedFound.length} discovered target(s) remain: ${uneditedFound.slice(0, 8).map((f: string) => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.`,
-							}],
-							timestamp: Date.now(),
-						});
-					}
-				}
-
-				if ((Date.now() - loopStart) >= GRACEFUL_EXIT_MS) {
-					await emit({ type: "turn_end", message, toolResults });
-					await emit({ type: "agent_end", messages: newMessages });
-					return;
-				}
-
-				if (
-					!hasProducedEdit &&
-					!finalNudgeSent &&
-					(Date.now() - loopStart) >= LATE_NUDGE_MS &&
-					pendingMessages.length === 0
-				) {
-					finalNudgeSent = true;
+			// Time caps and nudges must run even when the model returned **no** tool calls; otherwise
+			// idle/stop turns skip early/late nudges and graceful exit (benchmarks see no agent_end / stall).
+			if (!hasProducedEdit && pendingMessages.length === 0) {
+				const elapsed = Date.now() - loopStart;
+				const readList = pathsAlreadyRead.size > 0
+					? `Previously read: ${[...pathsAlreadyRead].slice(0, 5).join(", ")}. `
+					: "";
+				if (!earlyNudgeSent && elapsed >= EARLY_NUDGE_MS) {
+					earlyNudgeSent = true;
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply \`edit\` now — further discovery has diminishing returns.",
+								text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`edit\` to the most relevant file now. Even one correct change contributes to your score.`,
+							},
+						],
+						timestamp: Date.now(),
+					});
+				} else if (earlyNudgeSent && elapsed >= URGENT_NUDGE_MS && !urgentNudgeSent) {
+					urgentNudgeSent = true;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `${Math.round(elapsed/1000)}s in with zero file modifications. Time may be running out. ${readList}Make an edit immediately or accept a zero score.`,
 							},
 						],
 						timestamp: Date.now(),
 					});
 				}
+			}
+
+			if (hasProducedEdit && pendingMessages.length === 0) {
+				const elapsed = Date.now() - loopStart;
+				const uniqueEdited = new Set([...editedPaths].map(p => p.replace(/^\.\//, "")));
+				const uneditedFound = foundFiles.filter((f: string) => {
+					const nf = f.replace(/^\.\//, "");
+					return !uniqueEdited.has(nf);
+				});
+				if (uneditedFound.length > 0 && elapsed > 30_000 && uniqueEdited.size <= 2) {
+					pendingMessages.push({
+						role: "user",
+						content: [{
+							type: "text",
+							text: `30s+ elapsed and you have only edited ${uniqueEdited.size} file(s). ${uneditedFound.length} discovered target(s) remain: ${uneditedFound.slice(0, 8).map((f: string) => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.`,
+						}],
+						timestamp: Date.now(),
+					});
+				}
+			}
+
+			if ((Date.now() - loopStart) >= GRACEFUL_EXIT_MS) {
+				await emit({ type: "turn_end", message, toolResults });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			if (
+				!hasProducedEdit &&
+				!finalNudgeSent &&
+				(Date.now() - loopStart) >= LATE_NUDGE_MS &&
+				pendingMessages.length === 0
+			) {
+				finalNudgeSent = true;
+				pendingMessages.push({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply \`edit\` now — further discovery has diminishing returns.",
+						},
+					],
+					timestamp: Date.now(),
+				});
 			}
 
 			await emit({ type: "turn_end", message, toolResults });

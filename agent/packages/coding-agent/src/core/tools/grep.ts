@@ -31,11 +31,11 @@ const grepSchema = Type.Object({
 	context: Type.Optional(
 		Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
 	),
-	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 400)" })),
 });
 
 export type GrepToolInput = Static<typeof grepSchema>;
-const DEFAULT_LIMIT = 100;
+const DEFAULT_LIMIT = 400;
 
 export interface GrepToolDetails {
 	truncation?: TruncationResult;
@@ -127,9 +127,9 @@ export function createGrepToolDefinition(
 	return {
 		name: "grep",
 		label: "grep",
-		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.
+		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Default ${DEFAULT_LIMIT} matches (raise \`limit\` if needed) or ${DEFAULT_MAX_BYTES / 1024}KB output cap. Long lines truncated to ${GREP_MAX_LINE_LENGTH} chars.
 
-Tau: use task keywords and symbol names to build a complete list of files to edit. Missing one implied file loses all baseline matches for that file. Prefer this over shell grep when available.`,
+Tau: map every symbol and feature name to files — missing a relevant path loses line-level score for that file. Prefer this over shell grep when available.`,
 		promptSnippet: "Grep task symbols → full file set (tau)",
 		parameters: grepSchema,
 		async execute(

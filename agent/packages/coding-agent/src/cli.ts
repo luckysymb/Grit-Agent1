@@ -13,4 +13,11 @@ import { main } from "./main.js";
 
 setGlobalDispatcher(new EnvHttpProxyAgent());
 
-main(process.argv.slice(2));
+main(process.argv.slice(2)).catch((err: unknown) => {
+	const message = err instanceof Error ? err.message : String(err);
+	console.error(`Fatal: ${message}`);
+	if (err instanceof Error && err.stack) {
+		console.error(err.stack);
+	}
+	process.exitCode = 1;
+});

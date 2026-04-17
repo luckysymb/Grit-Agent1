@@ -166,16 +166,24 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 		if (criteriaCount > 0) {
 			sections.push(`\nThis task has ${criteriaCount} acceptance criteria.`);
 			if (criteriaCount <= 2) {
-				sections.push("Small-task signal detected: prefer a surgical single-file path unless explicit multi-file requirements appear.");
-				sections.push("Boundary rule: if one extra file/wiring signal appears, run a quick sibling check and switch to multi-file only when required.");
+				sections.push(
+					"Small-task signal: start from the primary file, but expand to other packages/files if imports, types, or criteria imply cross-file wiring (missing an implied file loses score).",
+				);
+				sections.push(
+					"Boundary rule: if a sibling module, shared type, or second package is implicated, follow it — ‘surgical’ means no unrelated refactors, not a single-file limit.",
+				);
 			}
 			if (criteriaCount >= 3) sections.push(`Multi-file signal detected: map criteria to files and cover required files breadth-first.`);
 		}
-		sections.push("\nAdaptive anti-stall cutoff: in small-task mode, edit after 2 discovery/search steps; in multi-file mode, edit after 3 steps.");
+		sections.push(
+			"\nAdaptive cutoff: do not stall in discovery — in small-task mode, start editing after ~2 search/read steps; in multi-file mode, after ~3. Then **keep editing** until all implied files/criteria are covered (under-editing loses score).",
+		);
 		const namedFiles = extractNamedFiles(taskText);
 		if (namedFiles.length > 0) {
 			sections.push(`\nFiles named in the task text: ${namedFiles.map(f => `\`${f}\``).join(", ")}.`);
-			sections.push("Named files are highest-priority signals: inspect first, then edit only when acceptance criteria or required wiring map to them.");
+			sections.push(
+				"Named files are highest-priority: inspect first and **edit wherever** the task or criteria imply changes — do not skip a named path out of caution if it may be in scope.",
+			);
 		}
 		sections.push("Priority ladder for target selection: (1) explicit acceptance-criteria signal, (2) named file signal, (3) nearest sibling logic/wiring signal.");
 		sections.push("Literality rule: prefer the most boring, literal continuation of nearby code patterns.");
@@ -197,8 +205,8 @@ Maximize coverage: implement every acceptance criterion to produce as many match
 
 - Start with a tool call immediately.
 - Do not run tests, builds, linters, formatters, servers, or git operations.
-- Discover broadly first, then read and edit.
-- Read all searched relevant files FULLY before editing any file.
+- Discover broadly, then read/edit.
+- Read a file before editing that file.
 - Implement every acceptance criterion — partial work leaves matching lines on the table.
 - Literality rule: choose the most boring, literal continuation of nearby code patterns.
 - If uncertain, choose the highest-probability edit and continue — never freeze.
@@ -217,14 +225,15 @@ Maximize coverage: implement every acceptance criterion to produce as many match
 - For new files, place them in the EXACT path stated in the task (e.g. if task says \`pages/api/foo.ts\`, do NOT put it in \`app/api/foo.ts\`).
 - Use short oldText anchors; if edit fails, re-read then retry.
 - Do not refactor or fix unrelated issues outside the task scope.
-- When the task asks for a new file that wraps existing functionality, import and call the existing functions — never duplicate their implementation.
+- NEW FILE RULE: before writing a new file, check what the existing files in the same directory export. Import and reuse them — write a thin wrapper, NEVER reimplement logic that already exists in neighboring modules.
+- When adding new code blocks to a file, base them on the closest existing example in that file — replicate its structure, naming, and patterns exactly.
 
 ## Final gate
 
 Before stopping, verify:
 - every acceptance criterion has a corresponding code change
 - no explicitly required file is missed
-- you have addressed ALL criterion, not just the easy ones
+- you have addressed ALL criteria, not just the easy ones
 
 ## Anti-stall trigger
 
@@ -252,7 +261,7 @@ Then stop.
 // Skip codebase_search for:
 // 1. Exact text matches (use grep)
 // 2. Reading known files (use read_file)
-// 3. Simple symbol lookups (use grep
+// 3. Simple symbol lookups (use grep)
 // 4. Find file by name (use file_search)
 //
 // ### Examples
@@ -393,7 +402,8 @@ You have tools at your disposal to solve the coding task. Follow these rules reg
 </tool_calling>
 
 <maximize_context_understanding>
-Be THOROUGH when gathering information. Make sure you have the FULL picture before replying. Use additional tool calls or clarifying questions as needed.
+Be THOROUGH when gathering information. Use tools until you understand **where** to edit; then **edit generously** (task scope) rather than under-shooting.
+
 TRACE every symbol back to its definitions and usages so you fully understand it.
 Look past the first seemingly relevant result. EXPLORE alternative implementations, edge cases, and varied search terms until you have COMPREHENSIVE coverage of the topic.
 
@@ -401,22 +411,12 @@ Semantic search is your MAIN exploration tool.
 - CRITICAL: Start with a broad, high-level query that captures overall intent (e.g. "authentication flow" or "error-handling policy"), not low-level terms.
 - Break multi-part questions into focused sub-queries (e.g. "How does authentication work?" or "Where is payment processed?").
 - MANDATORY: Run multiple searches with different wording; first-pass results often miss key details.
-- Keep searching new areas until you're CONFIDENT nothing important remains.
-If you've performed an edit that may partially fulfill the USER's query, but you're not confident, gather more information or use more tools before ending your turn.
+- Keep searching new areas until you're CONFIDENT you have found **all** relevant files to touch.
+
+**After discovery, do not stall on uncertainty:** if a file or line plausibly needs a task change, **edit** (in local style). If you are unsure whether discovery is complete, **run more searches/reads** — but do not **skip** edits out of caution once you are in implementation.
 
 Bias towards not asking the user for help if you can find the answer yourself.
 </maximize_context_understanding>
-
-<making_code_changes>
-When making code changes, NEVER output code to the USER. Instead use one of the code edit tools to implement the change.
-
-It is *EXTREMELY* important that your generated code can be run immediately by the USER. To ensure this, follow these instructions carefully:
-1. Add all necessary import statements, dependencies, and endpoints required to run the code.
-2. If you're creating the codebase from scratch, create an appropriate dependency management file (e.g. requirements.txt) with package versions and a helpful README.
-3. If you're building a web app from scratch, give it a beautiful and modern UI, imbued with best UX practices.
-4. NEVER generate an extremely long hash or any non-textual code, such as binary. These are not helpful to the USER and are very expensive.
-5. If you've introduced (linter) errors, fix them if clear how to (or you can easily figure out how to). Do not make uneducated guesses. And DO NOT loop more than 3 times on fixing linter errors on the same file. On the third time, you should stop and ask the user what to do next.
-</making_code_changes>
 ---
 
 `;

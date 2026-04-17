@@ -31,6 +31,8 @@ export interface PrintModeOptions {
 export async function runPrintMode(runtimeHost: AgentSessionRuntimeHost, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
+	/** Captures failures in `finally` so they affect the returned code (try/`return` alone would ignore them). */
+	let resolvedExitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 
@@ -123,10 +125,21 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntimeHost, options
 			}
 		}
 
-		return exitCode;
+		resolvedExitCode = exitCode;
 	} finally {
 		unsubscribe?.();
-		await runtimeHost.dispose();
-		await flushRawStdout();
+		try {
+			await runtimeHost.dispose();
+		} catch (err) {
+			console.error(`Runtime dispose error: ${err instanceof Error ? err.message : String(err)}`);
+			resolvedExitCode = resolvedExitCode || 1;
+		}
+		try {
+			await flushRawStdout();
+		} catch (err) {
+			console.error(`Stdout flush error: ${err instanceof Error ? err.message : String(err)}`);
+			resolvedExitCode = resolvedExitCode || 1;
+		}
 	}
+	return resolvedExitCode;
 }

@@ -1,11 +1,11 @@
 /**
  * `list_dir` — tau/Cursor_Tools.json (relative_workspace_path + optional explanation)
  */
+
+import { existsSync, readdirSync, statSync } from "node:fs";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
-import { existsSync, readdirSync, statSync } from "node:fs";
-import path from "node:path";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { resolveToCwd } from "./path-utils.js";
@@ -26,14 +26,14 @@ const listDirSchema = Type.Object({
 
 export type ListDirToolInput = Static<typeof listDirSchema>;
 
-const ENTRY_LIMIT = 500;
+const ENTRY_LIMIT = 2000;
 
 export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof listDirSchema, undefined> {
 	return {
 		name: "list_dir",
 		label: "list_dir",
 		description:
-			"List the contents of a directory (non-dot entries). Use for discovery before reading files or searching.",
+			"List the contents of a directory (non-dot entries; up to 2000 entries). Use for breadth-first discovery across packages before searching or reading files.",
 		parameters: listDirSchema,
 		async execute(
 			_toolCallId,
@@ -50,7 +50,7 @@ export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof 
 				throw new Error(`Not a directory: ${args.relative_workspace_path}`);
 			}
 
-			let entries = readdirSync(abs, { withFileTypes: true })
+			const entries = readdirSync(abs, { withFileTypes: true })
 				.filter((d) => !d.name.startsWith("."))
 				.sort((a, b) => {
 					if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;

@@ -1,12 +1,13 @@
 /**
- * `grep_search` — matches tau/Cursor_Tools.json (50 match cap).
+ * `grep_search` — regex ripgrep; high match cap for full file discovery (tau).
  */
+
+import { spawn } from "node:child_process";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
-import path from "node:path";
 import { ensureTool } from "../../utils/tools-manager.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { resolveToCwd } from "./path-utils.js";
@@ -14,7 +15,7 @@ import { str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { truncateLine } from "./truncate.js";
 
-const MATCH_CAP = 50;
+const MATCH_CAP = 500;
 
 const grepSearchSchema = Type.Object({
 	query: Type.String({ description: "The regex pattern to search for" }),
@@ -35,7 +36,7 @@ export function createGrepSearchToolDefinition(cwd: string): ToolDefinition<type
 		name: "grep_search",
 		label: "grep_search",
 		description:
-			"Fast regex search over text files (ripgrep). Results capped at 50 matches. Escape regex metacharacters for literal searches.",
+			"Fast regex search over text files (ripgrep). Results capped at 500 matches — use multiple queries if needed. Escape regex metacharacters for literal searches.",
 		parameters: grepSearchSchema,
 		async execute(
 			_toolCallId,
@@ -70,7 +71,10 @@ export function createGrepSearchToolDefinition(cwd: string): ToolDefinition<type
 
 				rl.on("line", (line) => {
 					if (n >= MATCH_CAP) return;
-					let ev: { type?: string; data?: { path?: { text?: string }; line_number?: number; lines?: { text?: string } } };
+					let ev: {
+						type?: string;
+						data?: { path?: { text?: string }; line_number?: number; lines?: { text?: string } };
+					};
 					try {
 						ev = JSON.parse(line);
 					} catch {
@@ -105,7 +109,9 @@ export function createGrepSearchToolDefinition(cwd: string): ToolDefinition<type
 		renderCall(args, theme, context) {
 			const q = str(args?.query);
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(theme.fg("toolTitle", theme.bold("grep_search")) + " " + theme.fg("accent", (q ?? "/?/").slice(0, 80)));
+			text.setText(
+				theme.fg("toolTitle", theme.bold("grep_search")) + " " + theme.fg("accent", (q ?? "/?/").slice(0, 80)),
+			);
 			return text;
 		},
 	};
