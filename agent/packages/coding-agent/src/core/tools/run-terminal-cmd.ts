@@ -14,6 +14,7 @@ import { truncateToVisualLines } from "../../modes/interactive/components/visual
 import { waitForChildProcess } from "../../utils/child-process.js";
 import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { asRecord, firstString, toBoolFlexible } from "./flexible-tool-args.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "./truncate.js";
@@ -30,6 +31,26 @@ const runTerminalCmdSchema = Type.Object({
 
 export type RunTerminalCmdToolInput = Static<typeof runTerminalCmdSchema>;
 
+function prepareRunTerminalCmdArguments(raw: unknown): RunTerminalCmdToolInput {
+	const o = asRecord(raw);
+	const command =
+		firstString(o, ["command", "cmd", "shell_command", "shellCmd", "shell", "script"]) ?? "";
+	let is_background =
+		toBoolFlexible(o.is_background) ??
+		toBoolFlexible(o.background) ??
+		toBoolFlexible(o.bg) ??
+		toBoolFlexible(o.run_in_background);
+	if (is_background === undefined) {
+		is_background = false;
+	}
+	const explanation = firstString(o, ["explanation", "reason", "purpose"]);
+	const out: RunTerminalCmdToolInput = { command, is_background };
+	if (explanation !== undefined) {
+		out.explanation = explanation;
+	}
+	return out;
+}
+
 const BASH_PREVIEW_LINES = 5;
 
 export interface RunTerminalCmdToolDetails {
@@ -44,6 +65,7 @@ export function createRunTerminalCmdToolDefinition(cwd: string): ToolDefinition<
 		description:
 			"Run a shell command in the workspace directory. When is_background is true, the process is detached and only start status is returned.",
 		parameters: runTerminalCmdSchema,
+		prepareArguments: prepareRunTerminalCmdArguments,
 		async execute(
 			_toolCallId,
 			args: { command: string; is_background: boolean; explanation?: string },

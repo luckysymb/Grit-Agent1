@@ -8,7 +8,8 @@ import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
-import { resolveReadPath } from "./path-utils.js";
+import { asRecord, firstString, firstStringOrSingleElementArray, toBoolFlexible, toIntFlexible } from "./flexible-tool-args.js";
+import { dedupeAppRouterRouteGroupSegment, resolveReadPath } from "./path-utils.js";
 import { getTextOutput, invalidArgText, replaceTabs, shortenPath, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.js";
@@ -21,17 +22,26 @@ const readFileSchema = Type.Object({
 		description:
 			"The path of the file to read. You can use either a relative path in the workspace or an absolute path.",
 	}),
-	should_read_entire_file: Type.Boolean({
-		description: "Whether to read the entire file. Defaults to false.",
-	}),
-	start_line_one_indexed: Type.Integer({
-		description: "The one-indexed line number to start reading from (inclusive).",
-		minimum: 1,
-	}),
-	end_line_one_indexed_inclusive: Type.Integer({
-		description: "The one-indexed line number to end reading at (inclusive).",
-		minimum: 1,
-	}),
+	should_read_entire_file: Type.Optional(
+		Type.Boolean({
+			description:
+				"If true, read the whole file (line range may be omitted). If false or omitted and no line range is given, the first chunk of the file is read.",
+		}),
+	),
+	start_line_one_indexed: Type.Optional(
+		Type.Integer({
+			description:
+				"One-indexed start line (inclusive). Optional when should_read_entire_file is true, or when relying on default first-chunk read.",
+			minimum: 1,
+		}),
+	),
+	end_line_one_indexed_inclusive: Type.Optional(
+		Type.Integer({
+			description:
+				"One-indexed end line (inclusive). Optional when should_read_entire_file is true, or when relying on default first-chunk read.",
+			minimum: 1,
+		}),
+	),
 	explanation: Type.Optional(
 		Type.String({
 			description: "One sentence explanation as to why this tool is being used, and how it contributes to the goal.",
@@ -41,6 +51,53 @@ const readFileSchema = Type.Object({
 
 export type ReadFileToolInput = Static<typeof readFileSchema>;
 
+function prepareReadFileArguments(raw: unknown): ReadFileToolInput {
+	const o = asRecord(raw);
+	let target_file =
+		firstStringOrSingleElementArray(o, ["target_file", "path", "file_path", "file", "filename", "filepath", "target"]) ??
+		firstString(o, ["target_file", "path", "file_path", "file", "filename", "filepath", "target"]) ??
+		"";
+	target_file = dedupeAppRouterRouteGroupSegment(target_file.replace(/\\/g, "/"));
+	const explanation = firstString(o, ["explanation", "reason", "purpose"]);
+	const should_read_entire_file =
+		toBoolFlexible(o.should_read_entire_file) ??
+		toBoolFlexible(o.read_entire_file) ??
+		toBoolFlexible(o.entire_file) ??
+		toBoolFlexible(o.full_file);
+	const start_line_one_indexed =
+		toIntFlexible(o.start_line_one_indexed) ??
+		toIntFlexible(o.start_line) ??
+		toIntFlexible(o.startLine) ??
+		toIntFlexible(o.line_start) ??
+		toIntFlexible(o.begin_line);
+	const end_line_one_indexed_inclusive =
+		toIntFlexible(o.end_line_one_indexed_inclusive) ??
+		toIntFlexible(o.end_line) ??
+		toIntFlexible(o.endLine) ??
+		toIntFlexible(o.line_end) ??
+		toIntFlexible(o.last_line);
+	const out: ReadFileToolInput = { target_file };
+	if (should_read_entire_file !== undefined) {
+		out.should_read_entire_file = should_read_entire_file;
+	}
+	if (explanation !== undefined) {
+		out.explanation = explanation;
+	}
+	if (start_line_one_indexed !== undefined) {
+		out.start_line_one_indexed = start_line_one_indexed;
+	}
+	if (end_line_one_indexed_inclusive !== undefined) {
+		out.end_line_one_indexed_inclusive = end_line_one_indexed_inclusive;
+	}
+	// Whole-file reads: some model payloads omit line fields; AJV may still expect keys present.
+	// Execute ignores these when should_read_entire_file is true (uses full line range).
+	if (out.should_read_entire_file === true) {
+		out.start_line_one_indexed = 1;
+		out.end_line_one_indexed_inclusive = 1;
+	}
+	return out;
+}
+
 export interface ReadFileToolDetails {
 	truncation?: TruncationResult;
 }
@@ -49,15 +106,16 @@ export function createReadFileToolDefinition(cwd: string): ToolDefinition<typeof
 	return {
 		name: "read_file",
 		label: "read_file",
-		description: `Read file contents with 1-indexed line numbers. At most ${MAX_LINES_PER_CALL} lines per call unless reading entire file (subject to byte limits).`,
+		description: `Read file contents with 1-indexed line numbers. At most ${MAX_LINES_PER_CALL} lines per call unless reading entire file (subject to byte limits). Prefer should_read_entire_file true for whole-file reads (start/end may be omitted). For partial reads, pass start_line_one_indexed and end_line_one_indexed_inclusive. For any existing file you will change with search_replace, edit, or edit_file, call read_file on that path first; if the result looks wrong, fix the path and retry.`,
 		parameters: readFileSchema,
+		prepareArguments: prepareReadFileArguments,
 		async execute(
 			_toolCallId,
 			args: {
 				target_file: string;
-				should_read_entire_file: boolean;
-				start_line_one_indexed: number;
-				end_line_one_indexed_inclusive: number;
+				should_read_entire_file?: boolean;
+				start_line_one_indexed?: number;
+				end_line_one_indexed_inclusive?: number;
 				explanation?: string;
 			},
 			_signal,
@@ -69,13 +127,23 @@ export function createReadFileToolDefinition(cwd: string): ToolDefinition<typeof
 			const raw = await fsReadFile(abs, "utf-8");
 			const lines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-			let start = Math.max(1, args.start_line_one_indexed);
-			let end = Math.max(start, args.end_line_one_indexed_inclusive);
+			const entireRequested = args.should_read_entire_file === true;
+			const hasStart = args.start_line_one_indexed !== undefined;
+			const hasEnd = args.end_line_one_indexed_inclusive !== undefined;
 
-			if (args.should_read_entire_file) {
+			let start: number;
+			let end: number;
+
+			if (entireRequested) {
 				start = 1;
 				end = lines.length;
-			} else {
+			} else if (hasStart || hasEnd) {
+				start = Math.max(1, args.start_line_one_indexed ?? 1);
+				let proposedEnd = args.end_line_one_indexed_inclusive;
+				if (proposedEnd === undefined) {
+					proposedEnd = Math.min(start + MAX_LINES_PER_CALL - 1, Math.max(start, lines.length));
+				}
+				end = Math.max(start, proposedEnd);
 				if (start > lines.length) {
 					throw new Error(`start_line_one_indexed ${start} past end of file (${lines.length} lines)`);
 				}
@@ -87,6 +155,10 @@ export function createReadFileToolDefinition(cwd: string): ToolDefinition<typeof
 				if (span < MIN_RANGE_LINES) {
 					throw new Error("Invalid line range");
 				}
+			} else {
+				// No line range and not full-file: default to first chunk (models often omit optional fields).
+				start = 1;
+				end = Math.min(lines.length, MAX_LINES_PER_CALL);
 			}
 
 			const total = lines.length;
@@ -99,7 +171,7 @@ export function createReadFileToolDefinition(cwd: string): ToolDefinition<typeof
 
 			const summary = `${before}${body}${after}`;
 			const truncation = truncateHead(summary, {
-				maxLines: args.should_read_entire_file ? DEFAULT_MAX_LINES : MAX_LINES_PER_CALL + 50,
+				maxLines: entireRequested || (start === 1 && end === lines.length) ? DEFAULT_MAX_LINES : MAX_LINES_PER_CALL + 50,
 				maxBytes: DEFAULT_MAX_BYTES,
 			});
 			const details: ReadFileToolDetails = {};

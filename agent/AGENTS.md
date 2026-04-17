@@ -1,148 +1,80 @@
-# Harness mandate (pi coding agent)
+# Agent instructions (Tau harness)
 
-This file mirrors the **default system prompt** in `packages/coding-agent` (built from `solver_runner`-style rules + Cursor-aligned tooling). If anything here disagrees with the live system prompt, **trust the system prompt**.
+The tau run compares your diff to a reference using **matched_changed_lines** (see `TAU_SCORING_PREAMBLE` in `packages/coding-agent/src/core/system-prompt.ts`). Surplus lines do not reduce the score; missing reference lines do.
 
-## Scoring
+**Canonical behavior** is defined in **`packages/coding-agent/src/core/system-prompt.ts`**: tau scoring preamble, injected task discovery (likely files, criteria count, discovery floor, mechanical hints), optional **Gemini** addendum, `[R]` tool-error recovery, style rules, **Final gate**, and anti-stall guidance. If this file ever disagrees with that prompt, **follow the system prompt**.
 
-Your diff is scored by **positional line-level exact matching** against a hidden reference:
+This document only adds what the code does not spell out: **Cursor/tau tool names** and a few **wording clarifications**.
 
-```
-score = matched_lines / max(your_lines, reference_lines)
-```
+---
 
-No semantic credit; no test execution. Surplus lines inflate the denominator; misaligned lines score zero.
+## Runtime shape (what you actually see)
 
-**Loss modes:** (1) **Surplus** — extra changed lines. (2) **Misalignment** — wrong whitespace, quotes, or ordering vs reference. Unnecessary comments or extra characters on touched lines hurt matches.
+With a task loaded, the harness typically builds:
 
-## Strategy (strict)
+`TAU_SCORING_PREAMBLE` → **task discovery block** (from `buildTaskDiscoverySection`) → **task text** → (optional) **Gemini discovery addendum** → project context / date / cwd.
 
-1. **Read** files that need to change **in full** before editing (`read_file` with `should_read_entire_file: true` when the task implies a full-file read).
-2. **Minimal diff** — every extra line hurts.
-3. **Match style** exactly: indentation, quotes, semicolons, naming, spacing.
-4. **Stop** when done — no closing summary, no test/build/lint runs, no re-reads after successful edits **unless** an edit failed (then `read_file` again before retrying).
+Treat the **injected discovery section** as authoritative for “which files to open first” and breadth signals.
 
-**Strict:** Imitate **existing** patterns in each file for every new or changed line. Do **not** reformat, rename, or “clean up” code the task did not ask you to touch.
+---
 
-**Minimal diff:** “Optimize” here means **minimize the patch**—fewest lines and narrowest edits—not faster algorithms or prettier structure unless the task asks. Large diffs usually mean **over-editing**.
+## CRITICAL — Coverage protocol (same as system prompt)
 
-**Not truncated:** A small diff must still be **fully complete**—every named file and acceptance bullet addressed. **Never** skip work to keep the patch short.
+**Omitting this loses score on entire files** (tests, client routes, APIs). On multi-criterion or multi-surface tasks you **must**:
 
-## Discover → plan → edit (before the first edit)
+1. **Systematic `grep_search`** — Use task literals (symbols, strings, backticked paths, named behaviors) as search queries; open plausible hits.
+2. **Layered search** — Repeat with different `target_directories` (client vs admin vs `lib` vs `__tests__` vs API). One broad `codebase_search` is insufficient.
+3. **Criterion-to-file checklist** — Map **each** acceptance bullet or named surface to at least one file you will edit. If a bullet names a surface and nothing on your list covers it, keep searching.
+4. **Planned edits for every named surface** — Do not stop after the first subtree; expand until every surface the task implies has a file on the checklist, then edit **breadth-first** across them.
 
-1. **Discover** — search and read until you understand the codebase and what must change.
-2. **Plan** — mentally re-check the task **several times** (three or more if needed); decide the **smallest** edit plan that can still **fully** complete the task.
-3. **Edit** — apply changes using the rules below (minimal diff, style match, full coverage).
+Full wording lives under **CRITICAL — Coverage protocol** in `packages/coding-agent/src/core/system-prompt.ts` (`TAU_SCORING_PREAMBLE`).
 
-**Goal:** **optimized** (small, surgical diff) **and** **fully completed** agent—not fast sloppy edits and not endless refactors.
+Also read **`## Breadth and thoroughness`** in the same preamble: vary `grep`/`codebase_search` queries, `list_dir` source roots, and treat injected *LIKELY RELEVANT FILES* as a **hint, not a cap**.
 
-## Critical rules
+**Discovery floor (injected per task):** Expect **at least 4–8+** distinct discovery tool calls before the first edit (higher when there are many acceptance bullets or UI+API+tests). The task block may spell out the exact minimum and a **thoroughness** line — follow it.
 
-- Change **only** what the task requires. No drive-by refactors or cosmetics.
-- **Do not** add comments, docstrings, type annotations, or extra error handling unless the task demands it.
-- **CRITICAL (line-level scoring):** Do **not** add unnecessary **comments** or unnecessary **characters** to code—the validator scores **line by line**, so extra letters or lines **lower your score**. **Follow each file’s original comment style strictly** (including leaving code comment-free where that is the local norm).
-- **Do not** reorder imports, rename variables, or fix unrelated issues.
-- Process files in **alphabetical path order**; within a file, edit **top to bottom**.
-- **Do not** run tests, builds, or linters.
-- **Do not** create new files unless the task explicitly requires it. Place new files next to related files; use `list_dir` on the target directory first.
-- When unsure whether to change a line, **leave it unchanged**.
-- **STRICT — mirror the repo:** New or edited lines must **match** how the same file already formats similar code (quotes, spacing, object style, HTML habits). **Copy** neighbors; do not invent a new style.
-- **STRICT — no drive-by changes:** Do **not** normalize, prettify, reorder, or tweak unrelated lines. **Touch only** what the task requires.
-- **STRICT — assume line-by-line grading:** Extra or altered lines that are not part of the reference solution **lower** the score.
+---
 
-## Strict consistency with original code (mandatory)
+## Harness tool mapping
 
-These **add to** all rules above:
+Do not assume generic `edit` / `oldText` APIs. This stack uses at least:
 
-- **Study before you write:** Look at **nearby** code in the same file and match its conventions before adding lines.
-- **One reason per line:** Each changed line should exist **only** because the task or acceptance criteria require it.
-- **No gratuitous rewording:** Do not paraphrase strings, labels, or HTML copy “for clarity” unless the task demands new wording.
-- **Hidden reference mindset:** Behave as if a **positional** diff is checked against a gold solution—**any** unnecessary deviation hurts.
+| Intent | Tool | Notes |
+|--------|------|--------|
+| Read | `read_file` | `target_file`; optional line range or `should_read_entire_file` |
+| Line-level replace | `search_replace` | `file_path`, `old_string`, `new_string` — copy exact text from `read_file` |
+| Region / sketch replace | `edit_file` | `target_file`, `instructions`, `code_edit` — **must** use `// ... existing code ...` (or language-appropriate) placeholders so you do not replace an entire large file with a short snippet |
+| Discover | `grep_search`, `file_search`, `codebase_search`, `list_dir` | Layer searches; `grep_search` optional `path` for subtree sweeps; scope `codebase_search` with `target_directories`; large caps — still run multiple calls with varied queries |
+| Create new file | Per task + tool schema | Put new files exactly where the task says; follow **NEW FILE RULE** in the system prompt (reuse neighbors, thin wrappers) |
 
-## Minimal diff — surgical edits (mandatory)
+**Overwrite trap:** Without placeholders, `edit_file` can replace the **whole** file — same warning as in `system-prompt.ts` (**Style and edit discipline**). Prefer `search_replace` for small edits, or `edit_file` with explicit placeholder segments.
 
-- **Smallest change that works:** Prefer **tiny** `search_replace` hunks and **avoid** rewriting whole functions or files unless the task requires it.
-- **No refactors for “clarity”:** Do not extract helpers, rename symbols, or restructure modules unless the task explicitly requests that.
-- **Surplus lines hurt scoring:** Remember `score = matched / max(your_lines, reference_lines)`—extra lines **lower** the score even when “correct.”
-- **Choose fewer files:** Touch only paths the task implies; do not opportunistically “fix” adjacent modules.
-- **Complete over short:** Among valid approaches, prefer fewer lines—but **never** omit required files, criteria, or behavior to shrink the diff.
+**`search_replace`:** Use anchors copied from `read_file`; if the harness exposes first-match-only vs replace-all, follow the tool description.
 
-## Integration refactors (hooks, events, configs — general)
+---
 
-When the task **switches** to a new hook, event, or API:
+## What to do (defer to system prompt for detail)
 
-- Use **exact** identifiers from the task/spec (names and casing).
-- **Replace** old wiring **in place** (e.g. swap one extracted field for another at the same location)—avoid duplicate reads and extra blocks.
-- Update **configs** with the smallest JSON change: when switching hooks/events, **rename or drop** the old hook entry—do **not** add the new hook while leaving the deprecated one registered unless the task says both are needed.
-- Update **tests** by swapping obsolete cases for required ones without renaming unrelated tests.
-- Update **docs**: remove obsolete env/rules text when behavior is removed; keep bullets **short** and consistent with the file’s style.
-- **Tests:** Add only what criteria imply—extra cases increase changed lines and lower positional match; mirror branch structure (variables, normalize) like other hooks in the same script.
+- **CRITICAL — Coverage protocol** (above): systematic grep + layered search + criterion-to-file checklist; non-optional for multi-surface tasks.
+- **Breadth:** Same file — search **more broadly than feels necessary**; multiple phrasings, `list_dir`, repo-wide `codebase_search` when layout is still unclear.
+- **Discovery:** Hard constraints + **Discovery floor** + **Final gate** in `system-prompt.ts` — multiple tool types, scoped passes, `grep_search` for task literals until coverage is credible.
+- **Execution order:** Breadth across required files before polishing one file (same idea as **Anti-stall** + breadth-first scoring in the prompt).
+- **Style:** Match the file’s existing style; misaligned lines score as zero overlap (**Style and edit discipline**).
+- **Scope:** Minimal change per criterion; no unrelated refactors, comments-only edits, or “cleanup” (**Hard constraints** / **Style and edit discipline**).
+- **Verification:** No tests, builds, linters, formatters, servers, or git unless the harness explicitly allows it (**Hard constraints**).
+- **Tool failures:** Read `[R]` lines and retry with corrected arguments on the next turn — do not assume an edit applied.
 
-## Multi-file tasks & acceptance criteria (coverage)
+---
 
-- If the task **names multiple files** (e.g. `dashboard.js`, `precompute.py`, `index.html`) or lists **several acceptance bullets** that imply code **and** docs/HTML/simulation, you must **edit every relevant file** before stopping. **Single-file partial solutions usually fail.**
-- **Map each acceptance bullet** to at least one edit somewhere. Bullets about “defaults,” “precomputation,” and “documentation/UI text” almost always mean **multiple files**.
-- **Keep numbers consistent** across files: the same ladder, factors, and labels wherever those values appear.
-- **Breadth-first:** apply a **first minimal pass on every target file** (alphabetical order), then refine—do not polish one file while others are untouched.
+## Task-text clarifications (not duplicated in code)
 
-## HTML / UI surfaces (do not skip)
+These are wording traps the prompt does not always repeat:
 
-When the task touches **documentation** or **HTML**, scan the **whole** file for user-visible strings tied to the feature—not only one block. After edits, **`grep_search`** in that file for stale phrases or numbers so nothing contradicts the new behavior.
+- **Rename vs delete:** “Remove section X” deletes the block. “Rename X to Y” / “Change labels from X to Y” keeps the structure and updates bindings, text, imports, and tags consistently.
+- **Single file, many criteria:** If every bullet maps to one file, walk the file top-to-bottom and satisfy **all** bullets — not only the first section.
 
-## Numeric parity (weights ↔ labels ↔ scripts)
+---
 
-Where the **same facts** appear in **multiple files** (code, scripts, UI), keep them **consistent**—no contradictory numbers or labels unless the task explicitly allows it.
+## Ambiguity
 
-## UI layout and style
-
-When you edit **UI** (HTML, components, layout, styling), **do not change** the **existing look or structure** unless the task **clearly and explicitly** asks for that. Prefer **minimal edits** (behavior, values, copy) inside the current design. **Restructure or restyle** only when the task requests it distinctly.
-
-## Tools (Cursor-compatible names)
-
-Default built-ins align with `tau/Cursor_Tools.json` naming:
-
-| Use case | Tool |
-|----------|------|
-| “Where does X happen?” (explore) | `codebase_search` |
-| Exact symbol / regex in files | `grep_search` |
-| Fuzzy path / filename | `file_search` |
-| Directory layout | `list_dir` (`relative_workspace_path`) |
-| Read before edit | `read_file` |
-| Apply edits | `edit_file` or `search_replace` |
-| Sparse shell (avoid test/build/lint) | `run_terminal_cmd` |
-| Remove a file (only if required) | `delete_file` |
-| Notebooks | `edit_notebook` |
-| Re-try a bad apply | `reapply` (only if supported; otherwise re-read and edit again) |
-
-**Discovery:** Prefer `codebase_search`, `grep_search`, `file_search`, and `list_dir`. Keep `run_terminal_cmd` sparse. The harness records the **workspace diff** — chat alone does not count.
-
-**Not available** in this agent (do not assume they exist): `todo_write`, `web_search`, persistent memory tools, `read_lints`, `glob_file_search`.
-
-**Parallelism:** When reads or searches are independent, batch them in one turn when possible.
-
-## Execution protocol
-
-1. **Parse the task** — extract **every** named path, symbols, and acceptance criteria; list implied files (including HTML/docs if the task ties copy to behavior).
-2. **Discover** all targets before editing (search tools — avoid gratuitous reads of unrelated files unless named).
-3. **Read** each target file in full when required; note style from existing code.
-4. **Breadth-first:** touch **every** file the task implies **before** second passes on any file.
-5. **Edit** with `edit_file` / `search_replace` — minimal anchors, unique `old_string` for replacements.
-6. **New files** only if explicitly required; sibling placement; `list_dir` first.
-7. **Stop** — no summary, no verification commands. All criteria and named files should already be covered.
-
-## Diff precision
-
-- Narrowest change wins; prefer `search_replace` with unique context when it is one clear substitution; use `edit_file` when sketching multiple regions (language-appropriate `// ... existing code ...` placeholders).
-- **Character-identical style** to surrounding code.
-- **Strict:** Unchanged regions should stay **untouched**—no drive-by formatting, quote flips, or trailing-space changes on lines you were not asked to modify.
-- **No** gratuitous README/package.json/tsconfig reads unless the task names them.
-- **No git** operations for scoring — the harness captures the diff.
-
-## Acceptance criteria & ambiguity
-
-- Count criteria; **2+ criteria** often spans **2+ files**; **3+** almost always does.
-- Prefer the **surgical** fix over a refactor.
-- If the task does not name an extra file, do not touch it.
-
-## Completion
-
-Smallest diff that satisfies the task wording **and full file coverage when multiple files are implied**. **Stop without a closing summary.** The harness reads your diff.
+Prefer the **priority ladder** in the task discovery block: acceptance-criteria signal → named paths → sibling/wiring. Prefer **surgical** changes over broad refactors when the system prompt allows either. When a criterion clearly applies but a line is borderline, implementing the criterion is usually safer than skipping (omission loses more than surplus).

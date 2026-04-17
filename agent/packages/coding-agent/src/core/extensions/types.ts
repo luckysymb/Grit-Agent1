@@ -56,22 +56,18 @@ import type {
 } from "../session-manager.js";
 import type { SlashCommandInfo } from "../slash-commands.js";
 import type { SourceInfo } from "../source-info.js";
-import type { BashOperations } from "../tools/bash.js";
-import type { EditToolDetails } from "../tools/edit.js";
-import type {
-	BashToolDetails,
-	BashToolInput,
-	EditToolInput,
-	FindToolDetails,
-	FindToolInput,
-	GrepToolDetails,
-	GrepToolInput,
-	LsToolDetails,
-	LsToolInput,
-	ReadToolDetails,
-	ReadToolInput,
-	WriteToolInput,
-} from "../tools/index.js";
+import type { BashOperations } from "../tools/bash-operations.js";
+import type { CodebaseSearchToolInput } from "../tools/codebase-search.js";
+import type { CursorEditFileToolInput } from "../tools/cursor-edit-file.js";
+import type { CursorSearchReplaceToolInput } from "../tools/cursor-search-replace.js";
+import type { DeleteFileToolInput } from "../tools/delete-file.js";
+import type { EditNotebookToolInput } from "../tools/edit-notebook.js";
+import type { FileSearchToolInput } from "../tools/file-search.js";
+import type { GrepSearchToolInput } from "../tools/grep-search.js";
+import type { ListDirToolInput } from "../tools/list-dir.js";
+import type { ReadFileToolDetails, ReadFileToolInput } from "../tools/read-file.js";
+import type { ReapplyToolInput } from "../tools/reapply.js";
+import type { RunTerminalCmdToolDetails, RunTerminalCmdToolInput } from "../tools/run-terminal-cmd.js";
 
 export type { ExecOptions, ExecResult } from "../exec.js";
 export type { AgentToolResult, AgentToolUpdateCallback };
@@ -674,39 +670,59 @@ interface ToolCallEventBase {
 	toolCallId: string;
 }
 
-export interface BashToolCallEvent extends ToolCallEventBase {
-	toolName: "bash";
-	input: BashToolInput;
+export interface RunTerminalCmdToolCallEvent extends ToolCallEventBase {
+	toolName: "run_terminal_cmd";
+	input: RunTerminalCmdToolInput;
 }
 
-export interface ReadToolCallEvent extends ToolCallEventBase {
-	toolName: "read";
-	input: ReadToolInput;
+export interface ReadFileToolCallEvent extends ToolCallEventBase {
+	toolName: "read_file";
+	input: ReadFileToolInput;
 }
 
-export interface EditToolCallEvent extends ToolCallEventBase {
-	toolName: "edit";
-	input: EditToolInput;
+export interface ListDirToolCallEvent extends ToolCallEventBase {
+	toolName: "list_dir";
+	input: ListDirToolInput;
 }
 
-export interface WriteToolCallEvent extends ToolCallEventBase {
-	toolName: "write";
-	input: WriteToolInput;
+export interface GrepSearchToolCallEvent extends ToolCallEventBase {
+	toolName: "grep_search";
+	input: GrepSearchToolInput;
 }
 
-export interface GrepToolCallEvent extends ToolCallEventBase {
-	toolName: "grep";
-	input: GrepToolInput;
+export interface EditFileToolCallEvent extends ToolCallEventBase {
+	toolName: "edit_file";
+	input: CursorEditFileToolInput;
 }
 
-export interface FindToolCallEvent extends ToolCallEventBase {
-	toolName: "find";
-	input: FindToolInput;
+export interface SearchReplaceToolCallEvent extends ToolCallEventBase {
+	toolName: "search_replace";
+	input: CursorSearchReplaceToolInput;
 }
 
-export interface LsToolCallEvent extends ToolCallEventBase {
-	toolName: "ls";
-	input: LsToolInput;
+export interface FileSearchToolCallEvent extends ToolCallEventBase {
+	toolName: "file_search";
+	input: FileSearchToolInput;
+}
+
+export interface CodebaseSearchToolCallEvent extends ToolCallEventBase {
+	toolName: "codebase_search";
+	input: CodebaseSearchToolInput;
+}
+
+export interface DeleteFileToolCallEvent extends ToolCallEventBase {
+	toolName: "delete_file";
+	input: DeleteFileToolInput;
+}
+
+export interface ReapplyToolCallEvent extends ToolCallEventBase {
+	toolName: "reapply";
+	input: ReapplyToolInput;
+}
+
+export interface EditNotebookToolCallEvent extends ToolCallEventBase {
+	toolName: "edit_notebook";
+	input: EditNotebookToolInput;
 }
 
 export interface CustomToolCallEvent extends ToolCallEventBase {
@@ -721,13 +737,17 @@ export interface CustomToolCallEvent extends ToolCallEventBase {
  * Later `tool_call` handlers see earlier mutations. No re-validation is performed after mutation.
  */
 export type ToolCallEvent =
-	| BashToolCallEvent
-	| ReadToolCallEvent
-	| EditToolCallEvent
-	| WriteToolCallEvent
-	| GrepToolCallEvent
-	| FindToolCallEvent
-	| LsToolCallEvent
+	| RunTerminalCmdToolCallEvent
+	| ReadFileToolCallEvent
+	| ListDirToolCallEvent
+	| GrepSearchToolCallEvent
+	| EditFileToolCallEvent
+	| SearchReplaceToolCallEvent
+	| FileSearchToolCallEvent
+	| CodebaseSearchToolCallEvent
+	| DeleteFileToolCallEvent
+	| ReapplyToolCallEvent
+	| EditNotebookToolCallEvent
 	| CustomToolCallEvent;
 
 interface ToolResultEventBase {
@@ -738,39 +758,29 @@ interface ToolResultEventBase {
 	isError: boolean;
 }
 
-export interface BashToolResultEvent extends ToolResultEventBase {
-	toolName: "bash";
-	details: BashToolDetails | undefined;
+export interface RunTerminalCmdToolResultEvent extends ToolResultEventBase {
+	toolName: "run_terminal_cmd";
+	details: RunTerminalCmdToolDetails | undefined;
 }
 
-export interface ReadToolResultEvent extends ToolResultEventBase {
-	toolName: "read";
-	details: ReadToolDetails | undefined;
+export interface ReadFileToolResultEvent extends ToolResultEventBase {
+	toolName: "read_file";
+	details: ReadFileToolDetails | undefined;
 }
 
-export interface EditToolResultEvent extends ToolResultEventBase {
-	toolName: "edit";
-	details: EditToolDetails | undefined;
-}
-
-export interface WriteToolResultEvent extends ToolResultEventBase {
-	toolName: "write";
-	details: undefined;
-}
-
-export interface GrepToolResultEvent extends ToolResultEventBase {
-	toolName: "grep";
-	details: GrepToolDetails | undefined;
-}
-
-export interface FindToolResultEvent extends ToolResultEventBase {
-	toolName: "find";
-	details: FindToolDetails | undefined;
-}
-
-export interface LsToolResultEvent extends ToolResultEventBase {
-	toolName: "ls";
-	details: LsToolDetails | undefined;
+/** Built-in tools whose results do not use structured details (or use unknown metadata). */
+export interface OtherBuiltinToolResultEvent extends ToolResultEventBase {
+	toolName:
+		| "list_dir"
+		| "grep_search"
+		| "edit_file"
+		| "search_replace"
+		| "file_search"
+		| "codebase_search"
+		| "delete_file"
+		| "reapply"
+		| "edit_notebook";
+	details: unknown;
 }
 
 export interface CustomToolResultEvent extends ToolResultEventBase {
@@ -780,36 +790,17 @@ export interface CustomToolResultEvent extends ToolResultEventBase {
 
 /** Fired after a tool executes. Can modify result. */
 export type ToolResultEvent =
-	| BashToolResultEvent
-	| ReadToolResultEvent
-	| EditToolResultEvent
-	| WriteToolResultEvent
-	| GrepToolResultEvent
-	| FindToolResultEvent
-	| LsToolResultEvent
+	| RunTerminalCmdToolResultEvent
+	| ReadFileToolResultEvent
+	| OtherBuiltinToolResultEvent
 	| CustomToolResultEvent;
 
-// Type guards for ToolResultEvent
-export function isBashToolResult(e: ToolResultEvent): e is BashToolResultEvent {
-	return e.toolName === "bash";
+export function isRunTerminalCmdToolResult(e: ToolResultEvent): e is RunTerminalCmdToolResultEvent {
+	return e.toolName === "run_terminal_cmd";
 }
-export function isReadToolResult(e: ToolResultEvent): e is ReadToolResultEvent {
-	return e.toolName === "read";
-}
-export function isEditToolResult(e: ToolResultEvent): e is EditToolResultEvent {
-	return e.toolName === "edit";
-}
-export function isWriteToolResult(e: ToolResultEvent): e is WriteToolResultEvent {
-	return e.toolName === "write";
-}
-export function isGrepToolResult(e: ToolResultEvent): e is GrepToolResultEvent {
-	return e.toolName === "grep";
-}
-export function isFindToolResult(e: ToolResultEvent): e is FindToolResultEvent {
-	return e.toolName === "find";
-}
-export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
-	return e.toolName === "ls";
+
+export function isReadFileToolResult(e: ToolResultEvent): e is ReadFileToolResultEvent {
+	return e.toolName === "read_file";
 }
 
 /**
@@ -817,8 +808,8 @@ export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
  *
  * Built-in tools narrow automatically (no type params needed):
  * ```ts
- * if (isToolCallEventType("bash", event)) {
- *   event.input.command;  // string
+ * if (isToolCallEventType("read_file", event)) {
+ *   event.input.target_file;  // string
  * }
  * ```
  *
@@ -829,16 +820,32 @@ export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
  * }
  * ```
  *
- * Note: Direct narrowing via `event.toolName === "bash"` doesn't work because
+ * Note: Direct narrowing via `event.toolName === "read_file"` doesn't work because
  * CustomToolCallEvent.toolName is `string` which overlaps with all literals.
  */
-export function isToolCallEventType(toolName: "bash", event: ToolCallEvent): event is BashToolCallEvent;
-export function isToolCallEventType(toolName: "read", event: ToolCallEvent): event is ReadToolCallEvent;
-export function isToolCallEventType(toolName: "edit", event: ToolCallEvent): event is EditToolCallEvent;
-export function isToolCallEventType(toolName: "write", event: ToolCallEvent): event is WriteToolCallEvent;
-export function isToolCallEventType(toolName: "grep", event: ToolCallEvent): event is GrepToolCallEvent;
-export function isToolCallEventType(toolName: "find", event: ToolCallEvent): event is FindToolCallEvent;
-export function isToolCallEventType(toolName: "ls", event: ToolCallEvent): event is LsToolCallEvent;
+export function isToolCallEventType(
+	toolName: "run_terminal_cmd",
+	event: ToolCallEvent,
+): event is RunTerminalCmdToolCallEvent;
+export function isToolCallEventType(toolName: "read_file", event: ToolCallEvent): event is ReadFileToolCallEvent;
+export function isToolCallEventType(toolName: "list_dir", event: ToolCallEvent): event is ListDirToolCallEvent;
+export function isToolCallEventType(toolName: "grep_search", event: ToolCallEvent): event is GrepSearchToolCallEvent;
+export function isToolCallEventType(toolName: "edit_file", event: ToolCallEvent): event is EditFileToolCallEvent;
+export function isToolCallEventType(
+	toolName: "search_replace",
+	event: ToolCallEvent,
+): event is SearchReplaceToolCallEvent;
+export function isToolCallEventType(toolName: "file_search", event: ToolCallEvent): event is FileSearchToolCallEvent;
+export function isToolCallEventType(
+	toolName: "codebase_search",
+	event: ToolCallEvent,
+): event is CodebaseSearchToolCallEvent;
+export function isToolCallEventType(toolName: "delete_file", event: ToolCallEvent): event is DeleteFileToolCallEvent;
+export function isToolCallEventType(toolName: "reapply", event: ToolCallEvent): event is ReapplyToolCallEvent;
+export function isToolCallEventType(
+	toolName: "edit_notebook",
+	event: ToolCallEvent,
+): event is EditNotebookToolCallEvent;
 export function isToolCallEventType<TName extends string, TInput extends Record<string, unknown>>(
 	toolName: TName,
 	event: ToolCallEvent,

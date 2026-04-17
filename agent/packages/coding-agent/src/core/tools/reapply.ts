@@ -5,6 +5,7 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
+import { firstString } from "./flexible-tool-args.js";
 import { str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -17,6 +18,13 @@ const reapplySchema = Type.Object({
 
 export type ReapplyToolInput = Static<typeof reapplySchema>;
 
+function prepareReapplyArguments(raw: unknown): ReapplyToolInput {
+	const o = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+	const target_file =
+		firstString(o, ["target_file", "path", "file_path", "file", "filename", "filepath"]) ?? "";
+	return { target_file };
+}
+
 export function createReapplyToolDefinition(): ToolDefinition<typeof reapplySchema, undefined> {
 	return {
 		name: "reapply",
@@ -24,6 +32,7 @@ export function createReapplyToolDefinition(): ToolDefinition<typeof reapplySche
 		description:
 			"Cursor re-applies the last edit with a stronger model; this runtime has no such pass. Re-read the file and issue edit_file or search_replace again.",
 		parameters: reapplySchema,
+		prepareArguments: prepareReapplyArguments,
 		async execute(
 			_toolCallId,
 			_args: { target_file: string },

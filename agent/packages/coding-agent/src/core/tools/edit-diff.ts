@@ -20,6 +20,17 @@ export function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
+/**
+ * Remove `read_file` tool line prefixes (e.g. `    42|const x = 1`) from pasted snippets.
+ * Models often copy numbered output verbatim; without stripping, search_replace and edit_file anchors never match disk.
+ */
+export function stripReadFileLineNumberPrefixes(text: string): string {
+	return text
+		.split("\n")
+		.map((line) => line.replace(/^\s*\d{1,6}\|\s?/, ""))
+		.join("\n");
+}
+
 export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
 	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }

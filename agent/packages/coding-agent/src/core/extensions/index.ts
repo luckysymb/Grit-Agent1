@@ -28,15 +28,13 @@ export type {
 	AppendEntryHandler,
 	// App keybindings (for custom editors)
 	AppKeybinding,
-	// Events - Tool (ToolCallEvent types)
-	BashToolCallEvent,
-	BashToolResultEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	// Context
 	CompactOptions,
+	CodebaseSearchToolCallEvent,
 	// Events - Agent
 	ContextEvent,
 	// Event Results
@@ -44,8 +42,9 @@ export type {
 	ContextUsage,
 	CustomToolCallEvent,
 	CustomToolResultEvent,
-	EditToolCallEvent,
-	EditToolResultEvent,
+	DeleteFileToolCallEvent,
+	EditFileToolCallEvent,
+	EditNotebookToolCallEvent,
 	ExecOptions,
 	ExecResult,
 	Extension,
@@ -68,22 +67,19 @@ export type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
-	FindToolCallEvent,
-	FindToolResultEvent,
+	FileSearchToolCallEvent,
 	GetActiveToolsHandler,
 	GetAllToolsHandler,
 	GetCommandsHandler,
 	GetThinkingLevelHandler,
-	GrepToolCallEvent,
-	GrepToolResultEvent,
+	GrepSearchToolCallEvent,
 	// Events - Input
 	InputEvent,
 	InputEventResult,
 	InputSource,
 	KeybindingsManager,
+	ListDirToolCallEvent,
 	LoadExtensionsResult,
-	LsToolCallEvent,
-	LsToolResultEvent,
 	// Events - Message
 	MessageEndEvent,
 	// Message Rendering
@@ -93,11 +89,13 @@ export type {
 	MessageUpdateEvent,
 	ModelSelectEvent,
 	ModelSelectSource,
+	OtherBuiltinToolResultEvent,
 	// Provider Registration
 	ProviderConfig,
 	ProviderModelConfig,
-	ReadToolCallEvent,
-	ReadToolResultEvent,
+	ReadFileToolCallEvent,
+	ReadFileToolResultEvent,
+	ReapplyToolCallEvent,
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
@@ -105,6 +103,9 @@ export type {
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	RunTerminalCmdToolCallEvent,
+	RunTerminalCmdToolResultEvent,
+	SearchReplaceToolCallEvent,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,
@@ -149,18 +150,7 @@ export type {
 	UserBashEvent,
 	UserBashEventResult,
 	WidgetPlacement,
-	WriteToolCallEvent,
-	WriteToolResultEvent,
 } from "./types.js";
 // Type guards
-export {
-	isBashToolResult,
-	isEditToolResult,
-	isFindToolResult,
-	isGrepToolResult,
-	isLsToolResult,
-	isReadToolResult,
-	isToolCallEventType,
-	isWriteToolResult,
-} from "./types.js";
+export { isReadFileToolResult, isRunTerminalCmdToolResult, isToolCallEventType } from "./types.js";
 export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.js";

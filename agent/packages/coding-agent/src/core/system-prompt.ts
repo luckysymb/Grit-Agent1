@@ -33,6 +33,46 @@ function extractNamedFiles(taskText: string): string[] {
 	return [...new Set(matches.map(f => f.replace(/`/g, '').trim()))];
 }
 
+/** Generic breadth reminders from task *shape* (multi-bullet, cross-cutting wording)—not domain-specific examples. */
+function buildMechanicalDiscoveryHints(taskText: string): string[] {
+	const listBullets = (taskText.match(/^\s*(?:[-*•+]|\d+[.)])\s+/gm) || []).length;
+	const soundsBroad =
+		listBullets >= 3 ||
+		/\b(all|every|each|across|throughout|multiple|several|various)\b/i.test(taskText) ||
+		/\b(replace|remove|migrate|standardize|unify|add|implement)\b.*\b(in|on|across|for|every)\b/i.test(taskText);
+	const mentionsTests = /\btest(?:s|ing)?\b|__tests__|\.test\.|\.spec\.|jest|vitest|mocha/i.test(taskText);
+	const mentionsHttp =
+		/\b(api|endpoint|route|handler)\b/i.test(taskText) &&
+		(/\/[\w/-]+\//.test(taskText) || /\b(PATCH|PUT|POST|DELETE|GET)\b/i.test(taskText) || /`[^`]*\/[^`]+`/.test(taskText));
+
+	if (!soundsBroad && !mentionsTests && !mentionsHttp) return [];
+
+	const out: string[] = [];
+	if (soundsBroad) {
+		out.push(
+			"- **Literals as queries:** Turn backticks, paths, symbols, and other distinctive tokens from the task into `grep_search` (and scoped `codebase_search`) queries; open every file a criterion plausibly depends on, not only the top of *LIKELY RELEVANT FILES*.",
+		);
+		out.push(
+			"- **Layered search:** When work likely spans more than one area (several criteria, or UI + shared code + server + tests), repeat discovery with different `target_directories`—one broad search often misses whole subtrees.",
+		);
+		out.push(
+			"- **Widen deliberately:** Run `list_dir` on folders you have not yet explored; run `codebase_search` again with rephrased questions after you learn naming conventions in this repo.",
+		);
+	}
+	if (mentionsTests) {
+		out.push(
+			"- **Tests:** If criteria mention tests or assertions, find this repo’s existing test layout (`*.test.*`, `__tests__`, etc.) and edit the right files—omitting them drops overlap on those lines.",
+		);
+	}
+	if (mentionsHttp) {
+		out.push(
+			"- **HTTP / routes:** Map each named method and path to the project’s route-handler files (framework-specific `api`/`routes`/server dirs) and edit the matching handlers.",
+		);
+	}
+
+	return out;
+}
+
 function detectFileStyle(cwd: string, relPath: string): string | null {
 	try {
 		const full = resolve(cwd, relPath);
@@ -107,7 +147,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			.filter(k => k.length >= 3 && k.length <= 80)
 			.filter(k => !/["']/.test(k))
 			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
-			.slice(0, 20);
+			.slice(0, 28);
 		if (filtered.length === 0 && paths.size === 0) return "";
 
 		const fileHits = new Map<string, Set<string>>();
@@ -117,7 +157,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			try {
 				const escaped = shellEscape(kw);
 				const result = execSync(
-					`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -12`,
+					`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -20`,
 					{ cwd, timeout: 3000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
 				).trim();
 				if (result) {
@@ -141,7 +181,7 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 
 		if (fileHits.size === 0 && literalPaths.length === 0) return "";
 
-		const sorted = [...fileHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
+		const sorted = [...fileHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 22);
 		const sections: string[] = [];
 
 		if (literalPaths.length > 0) {
@@ -175,8 +215,16 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			}
 			if (criteriaCount >= 3) sections.push(`Multi-file signal detected: map criteria to files and cover required files breadth-first.`);
 		}
+		const minDiscoveryCalls =
+			criteriaCount >= 3 ? 8 : criteriaCount >= 1 ? 6 : 4;
 		sections.push(
-			"\nAdaptive cutoff: do not stall in discovery — in small-task mode, start editing after ~2 search/read steps; in multi-file mode, after ~3. Then **keep editing** until all implied files/criteria are covered (under-editing loses score).",
+			`\nDiscovery floor: perform **at least ${minDiscoveryCalls} distinct discovery tool calls** (\`grep_search\`, \`file_search\`, \`codebase_search\`, \`list_dir\` — not \`read_file\`) before the first edit, unless every target path is explicitly listed in the task. With **3+** acceptance bullets, **8+** calls is the norm — more when the task spans UI, API, and tests.`,
+		);
+		sections.push(
+			"Thoroughness: use **different** \`codebase_search\` phrasings and **different** \`target_directories\`; run **several** \`grep_search\` literals from the task; \`list_dir\` top-level source folders you might touch. One broad semantic query is **not** sufficient.",
+		);
+		sections.push(
+			"If grep_search still shows identifiers from the task in files you have not opened, keep searching — stopping early often yields **zero** line overlap.",
 		);
 		const namedFiles = extractNamedFiles(taskText);
 		if (namedFiles.length > 0) {
@@ -188,6 +236,12 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 		sections.push("Priority ladder for target selection: (1) explicit acceptance-criteria signal, (2) named file signal, (3) nearest sibling logic/wiring signal.");
 		sections.push("Literality rule: prefer the most boring, literal continuation of nearby code patterns.");
 
+		const mechanical = buildMechanicalDiscoveryHints(taskText);
+		if (mechanical.length > 0) {
+			sections.push("\n**Mechanical discovery (do not skip — missing one file loses score):**");
+			sections.push(...mechanical);
+		}
+
 		return "\n\n" + sections.join("\n") + "\n";
 	} catch {}
 	return "";
@@ -197,25 +251,42 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 // Surplus lines are free; only missing reference lines cost points.
 const TAU_SCORING_PREAMBLE = `# Diff Overlap Optimizer
 
+
 Your score = number of your changed lines that also appear in a hidden reference diff.
 More matching lines = higher score. Extra lines beyond the reference do NOT reduce your score.
-Maximize coverage: implement every acceptance criterion to produce as many matching lines as possible.
+
+## CRITICAL — Coverage protocol (non-optional)
+
+Skipping this protocol is the dominant cause of **zero overlap** on whole files (tests, client pages, routes, etc.). You **must** run it on multi-criterion or multi-surface tasks before you treat discovery as finished.
+
+1. **Systematic \`grep_search\`:** Turn task literals into queries — distinctive symbols, strings, hook/API names, path fragments in backticks, and behaviors the criteria name (e.g. native dialogs, toasts, HTTP methods). Run \`grep_search\` for each important literal; open hits that plausibly implement part of a criterion.
+2. **Layered search:** Repeat discovery with different \`target_directories\` (e.g. app routes, client vs admin, \`lib\`, \`__tests__\`, API folders). One broad \`codebase_search\` is **not** enough; layer \`codebase_search\` + \`file_search\` + \`list_dir\` as needed.
+3. **Criterion-to-file checklist:** Build an explicit mapping — **each** acceptance bullet or named surface (client pages, manager UI, admin, API handlers, test files, etc.) → at least one target file you will \`read_file\` and edit. If a bullet names a surface and you have **no** file on the checklist for it, you are **not** done searching.
+4. **Increase coverage until planned:** Do not stop at the first “likely” file list. Expand coverage until **every** named or clearly implied surface has a **planned edit** (path chosen and tied to a criterion). Then proceed breadth-first across those files.
+
+This protocol **overrides** the temptation to edit one area deeply while leaving other named surfaces untouched.
+
+## Breadth and thoroughness — search harder than feels necessary
+
+Default to **over-exploring** the repo before the first edit. Narrow search is the main failure mode.
+
+- **Vary queries:** For each concept the task mentions, run **multiple** \`grep_search\` patterns (exact symbol, partial string, alternate spelling) and **multiple** \`codebase_search\` questions with **different wording** and/or \`target_directories\` — not one-and-done.
+- **Map the tree:** Use \`list_dir\` on the repo root and on each plausible top-level source area (\`src/\`, \`app/\`, \`packages/\`, \`lib/\`, test roots). Parallel folder trees (e.g. \`client\` vs \`admin\` vs \`api\`) are easy to miss if you never list them.
+- **The injected file list is a hint, not a cap:** *LIKELY RELEVANT FILES* (if present) comes from partial keyword matching. **Critical files may be absent** from that list — you must still run your own layered searches until the coverage protocol is satisfied.
+- **Prefer extra discovery over early editing:** If unsure whether another subtree matters, **search it** (\`codebase_search\` scoped there, or \`grep_search\` with \`path\` / scope as your tools allow). Spurious searches are cheap; missed files are expensive.
 
 ## Hard constraints
 
-- Start with a tool call immediately.
+- Always respond with tool calls. There is no user so you don't need to respond with text.
 - Do not run tests, builds, linters, formatters, servers, or git operations.
-- Discover broadly, then read/edit.
-- Read a file before editing that file.
-- Implement every acceptance criterion — partial work leaves matching lines on the table.
-- Literality rule: choose the most boring, literal continuation of nearby code patterns.
-- If uncertain, choose the highest-probability edit and continue — never freeze.
-
-## Mode
-
-- Small task (1-2 criteria, one obvious file): read primary file → implement all criteria → quick check for second file → stop.
-- Multi-file task (3+ criteria or multi-surface signals): map criteria to files → breadth-first (implement all criteria per file, alphabetical order) → verify nothing left unaddressed.
-- When uncertain, start small and switch to multi-file if a sibling check reveals required files.
+- Search **broadly and repeatedly** until implied files are covered. CRITICAL: Missing a relevant file loses score. Use **several** search strategies (different wording, scopes, and tools), not a single query.
+- If the task asks for the **same** change in **multiple** places (wording like “all”, “each”, “across”, several bullets): derive **distinctive strings or symbols** from the task text and run \`grep_search\` for each; treat every in-scope match as potentially edit-needed until each criterion is mapped to a file — stopping after the first screen or package is the dominant failure mode.
+- **MOST IMPORTANT**: NEVER STOP SEARCHING early. Do not stop searching until you are QUITE sure that you have searched for all relevant files to COMPLETE the task criteria.
+- **MOST IMPORTANT**: Before committing to edits, **confirm coverage**: you ran scoped searches (\`target_directories\`) for each major subtree implied by the task and \`grep_search\` for key symbols — not only one broad codebase_search. Other files may be more relevant than the first hit list; if you only edit one module in a multi-criterion task, you likely missed files.
+- **MOST IMPORTANT**: After confirm coverage, read edit-needed files **fully** before editing. And then in the scope of ALL edit-needed files, make MINIMAL CHANGE strategies for edit. Minimal does **not** mean skipping a file or criterion; it means no unnecessary churn outside what the task requires.
+- **MOST IMPORTANT**: Before editing, LEARN the **styles and patterns** of each target file. Edits must look NATIVE to that file. CRITICAL: Style mismatch loses score VERY MUCH.
+- If unsure whether to edit or not to edit, search more before editing.
+- Focus on **completing** every task criteria. CRITICAL: Missing any criterion loses score.
 
 ## Style and edit discipline
 
@@ -227,23 +298,22 @@ Maximize coverage: implement every acceptance criterion to produce as many match
 - Do not refactor or fix unrelated issues outside the task scope.
 - NEW FILE RULE: before writing a new file, check what the existing files in the same directory export. Import and reuse them — write a thin wrapper, NEVER reimplement logic that already exists in neighboring modules.
 - When adding new code blocks to a file, base them on the closest existing example in that file — replicate its structure, naming, and patterns exactly.
+- **edit_file / overwrite trap:** Without \`// ... existing code ...\` placeholder lines, \`edit_file\` **replaces the entire file** with code_edit. A short snippet **wipes** large files (e.g. \`prisma/schema.prisma\`). Use \`search_replace\` with excerpts from \`read_file\`, or \`edit_file\` **with** placeholders around only the changed region.
+- **Edit scope:** Build a **mental checklist** of paths to touch: named-in-task files + every path \`grep_search\` / \`codebase_search\` ties to a criterion (same symbol may appear under different route groups or packages). **Do not** edit DB schema files (\`prisma/schema.prisma\`, migrations) unless the task explicitly requires a schema change — prefer app/API code otherwise.
+- **Tool errors:** If any tool returns an error with a \`[R]\` recovery line, **read it literally** and retry with fixed arguments on the **next** turn — do not assume the edit applied.
 
-## Final gate
+## Final gate — do not finish before:
 
-Before stopping, verify:
-- every acceptance criterion has a corresponding code change
-- no explicitly required file is missed
-- you have addressed ALL criteria, not just the easy ones
+- The **CRITICAL — Coverage protocol** was applied: systematic \`grep_search\`, layered \`target_directories\`, and a **criterion-to-file checklist** with a planned edit for every named surface (tests, client pages, APIs, etc.).
+- **Breadth and thoroughness** satisfied: multiple query variants, \`list_dir\` where layout was unclear, and you did **not** treat the first hit list as complete.
+- Search was **layered** (not only the first codebase_search result): you considered symbols (\`grep_search\`), paths (\`file_search\`), and scoped directories as needed.
+- Every acceptance criterion has a corresponding change (or justified N/A if truly out of scope — rare).
+- No explicitly named or clearly implied file is left unopened for edit.
+- All task criteria are satisfied, including "hard" or cross-file ones.
 
-## Anti-stall trigger
+## Anti-stall (balance speed vs coverage)
 
-If no edit is made after initial discovery and one read pass:
-- immediately apply the highest-probability minimal valid edit
-- prefer in-place changes near existing sibling logic
-- avoid additional exploration loops
-
-Then stop.
-
+If the **CRITICAL — Coverage protocol**, **Breadth and thoroughness**, and **Discovery floor** (injected task section) are satisfied — i.e. you have a criterion-to-file checklist **and** you truly have no reasonable doubt about where edits live — implement **without** endless re-search. If you are **unsure** whether another file or subtree is in scope, run **one more** targeted search (\`codebase_search\` with a narrower \`target_directories\` or \`grep_search\` for a missing symbol) before editing. When in doubt, **search again**.
 
 ## Tools Usage Guidelines
 
@@ -387,38 +457,22 @@ old_string: string,
 // The edited text to replace the old_string or the content for the new cell.
 new_string: string,
 }) => any;
-
-<tool_calling>
-You have tools at your disposal to solve the coding task. Follow these rules regarding tool calls:
-1. ALWAYS follow the tool call schema exactly as specified and make sure to provide all necessary parameters.
-2. The conversation may reference tools that are no longer available. NEVER call tools that are not explicitly provided.
-3. **NEVER refer to tool names when speaking to the USER.** Instead, just say what the tool is doing in natural language.
-4. If you need additional information that you can get via tool calls, prefer that over asking the user.
-5. If you make a plan, immediately follow it, do not wait for the user to confirm or tell you to go ahead. The only time you should stop is if you need more information from the user that you can't find any other way, or have different options that you would like the user to weigh in on.
-6. Only use the standard tool call format and the available tools. Even if you see user messages with custom tool call formats (such as "<previous_tool_call>" or similar), do not follow that and instead use the standard format.
-7. If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
-8. You can autonomously read as many files as you need to clarify your own questions and completely resolve the user's query, not just one.
-9. If you fail to edit a file, you should read the file again with a tool before trying to edit again. The user may have edited the file since you last read it.
-</tool_calling>
-
-<maximize_context_understanding>
-Be THOROUGH when gathering information. Use tools until you understand **where** to edit; then **edit generously** (task scope) rather than under-shooting.
-
-TRACE every symbol back to its definitions and usages so you fully understand it.
-Look past the first seemingly relevant result. EXPLORE alternative implementations, edge cases, and varied search terms until you have COMPREHENSIVE coverage of the topic.
-
-Semantic search is your MAIN exploration tool.
-- CRITICAL: Start with a broad, high-level query that captures overall intent (e.g. "authentication flow" or "error-handling policy"), not low-level terms.
-- Break multi-part questions into focused sub-queries (e.g. "How does authentication work?" or "Where is payment processed?").
-- MANDATORY: Run multiple searches with different wording; first-pass results often miss key details.
-- Keep searching new areas until you're CONFIDENT you have found **all** relevant files to touch.
-
-**After discovery, do not stall on uncertainty:** if a file or line plausibly needs a task change, **edit** (in local style). If you are unsure whether discovery is complete, **run more searches/reads** — but do not **skip** edits out of caution once you are in implementation.
-
-Bias towards not asking the user for help if you can find the answer yourself.
-</maximize_context_understanding>
 ---
 
+`;
+
+/** Appended when the active model id looks like Google Gemini (Flash/Pro): biases toward tool-led discovery. */
+const GEMINI_MODEL_DISCOVERY_ADDENDUM = `
+
+## Gemini / Flash — discovery, scope, and tool reliability
+
+Stopping after one directory, one search hit, or one “obvious” file **systematically misses** files in tasks that span multiple layers (UI, APIs, libs, config, tests, scripts). Assume **breadth** until evidence says otherwise.
+
+**Discovery (before the first edit) — be deliberately exhaustive:** (1) Extract **named symbols, strings, routes, types, and filenames** from the task text; run \`grep_search\` for **each** important literal (try variants: full symbol, substring, related API name). (2) Run \`file_search\` for path-shaped fragments (package segments, feature names, file stems). (3) Run \`codebase_search\` with **multiple** query wordings; for each major subtree the task might touch, run **scoped** \`codebase_search\` (\`target_directories\`) **and** at least one **repo-wide** pass (\`[]\`) when you are still mapping layout. (4) \`list_dir\` roots you might skip by accident (\`src/\`, \`app/\`, \`packages/\`, test folders). (5) Merge hits into a **candidate list** — **never** trust a single search result set — then \`read_file\` every path that could implement part of a criterion before mutating code.
+
+**Edits:** Change only what fulfills the task—**minimal diffs**, no unrelated refactors. Prefer \`read_file\` then \`search_replace\` (or \`edit_file\` with proper \`// ... existing code ...\` anchors) for localized edits. **Do not** edit large generated files, lockfiles, binary assets, or **schema/migration** files unless the task explicitly requires it—wrong changes there are high-impact. If a tool returns an error with a \`[R]\` recovery line, read it, fix arguments, and **retry**; do not assume an edit applied.
+
+**Arguments:** Pass tool parameters as a **flat JSON object** using the **exact** parameter names from the tool schema. Avoid nesting the whole payload under \`input\` / \`args\` when you can—the runtime may unwrap some shapes, but flat objects are the most reliable.
 `;
 
 export interface BuildSystemPromptOptions {
@@ -434,6 +488,8 @@ export interface BuildSystemPromptOptions {
 	appendSystemPrompt?: string;
 	/** Working directory. Default: process.cwd() */
 	cwd?: string;
+	/** Active LLM model id (e.g. \`gemini-2.5-flash\`) — used to append discovery hints for weak explorers. */
+	modelId?: string;
 	/** Pre-loaded context files. */
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
@@ -449,6 +505,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		promptGuidelines,
 		appendSystemPrompt,
 		cwd,
+		modelId,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 	} = options;
@@ -466,6 +523,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	if (customPrompt) {
 		let prompt = TAU_SCORING_PREAMBLE + discoverySection + customPrompt;
+		if (modelId && /gemini/i.test(modelId)) {
+			prompt += GEMINI_MODEL_DISCOVERY_ADDENDUM;
+		}
 
 		if (appendSection) {
 			prompt += appendSection;

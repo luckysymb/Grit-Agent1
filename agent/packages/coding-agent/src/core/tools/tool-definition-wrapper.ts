@@ -1,4 +1,5 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
+import { sanitizeRawToolArguments } from "../../utils/gemini-tool-sanitize.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 
 /** Wrap a ToolDefinition into an AgentTool for the core runtime. */
@@ -11,7 +12,13 @@ export function wrapToolDefinition<TDetails = unknown>(
 		label: definition.label,
 		description: definition.description,
 		parameters: definition.parameters,
-		prepareArguments: definition.prepareArguments,
+		prepareArguments: (raw: unknown) => {
+			const sanitized = sanitizeRawToolArguments(definition.name, raw);
+			if (definition.prepareArguments) {
+				return definition.prepareArguments(sanitized);
+			}
+			return sanitized as any;
+		},
 		execute: (toolCallId, params, signal, onUpdate) =>
 			definition.execute(toolCallId, params, signal, onUpdate, ctxFactory?.() as ExtensionContext),
 	};

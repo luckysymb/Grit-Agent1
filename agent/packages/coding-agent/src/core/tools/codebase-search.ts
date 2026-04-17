@@ -4,7 +4,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
@@ -14,16 +14,17 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.js"
 import { ensureTool } from "../../utils/tools-manager.js";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import { augmentKeywordsNlp, buildSeedKeywords, extractLoyalPhrases } from "./codebase-search-nlp.js";
-import { resolveToCwd } from "./path-utils.js";
+import { asRecord, coalesceTargetDirectoryField, firstStringOrJoinedArray } from "./flexible-tool-args.js";
+import { resolveReadPath, resolveToCwd } from "./path-utils.js";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "./truncate.js";
 
-const SEARCH_ROUNDS = 5;
+const SEARCH_ROUNDS = 8;
 /** Files read per round to mine identifiers for keyword augmentation (full discovery). */
-const TOP_FILES_TO_READ = 24;
+const TOP_FILES_TO_READ = 40;
 /** Cap per high-hit file when mining tokens for augmentation (bytes). */
-const NLP_READ_BYTES = 96 * 1024;
+const NLP_READ_BYTES = 160 * 1024;
 
 const codebaseSearchSchema = Type.Object({
 	query: Type.String({
@@ -45,9 +46,30 @@ const codebaseSearchSchema = Type.Object({
 
 export type CodebaseSearchToolInput = Static<typeof codebaseSearchSchema>;
 
+function prepareCodebaseSearchArguments(raw: unknown): CodebaseSearchToolInput {
+	const o = asRecord(raw);
+	let query = firstStringOrJoinedArray(o, ["query", "q", "search", "text", "question", "prompt"]) ?? "";
+	query = query.trim();
+	if (!query) {
+		const fallback =
+			firstStringOrJoinedArray(o, ["explanation", "description", "context"]) ?? "search";
+		query = fallback.trim().slice(0, 400) || "search";
+	}
+	const explanation = firstStringOrJoinedArray(o, ["explanation", "reason", "purpose", "context"]);
+	const target_directories = coalesceTargetDirectoryField(o);
+	const out: CodebaseSearchToolInput = { query };
+	if (explanation !== undefined) {
+		out.explanation = explanation;
+	}
+	if (target_directories?.length) {
+		out.target_directories = target_directories;
+	}
+	return out;
+}
+
 /** Ranked paths returned (tau: missing implied file ⇒ 0 score — surface many candidates). */
-const DEFAULT_FILE_LIMIT = 100;
-const SNIPPET_LINES = 5;
+const DEFAULT_FILE_LIMIT = 180;
+const SNIPPET_LINES = 8;
 
 function escapeRgLiteral(s: string): string {
 	return s.replace(/[\\.*+?^${}()|[\]\\]/g, "\\$&");
@@ -68,7 +90,7 @@ function dedupeKeywordsPreserveOrder(keywords: string[]): string[] {
 function buildInitialKeywordSet(query: string, explanation?: string): string[] {
 	const seeds = buildSeedKeywords(query, explanation);
 	const loyal = `${query}\n${explanation ?? ""}`;
-	const phrases = extractLoyalPhrases(loyal, 14);
+	const phrases = extractLoyalPhrases(loyal, 22);
 	const merged = dedupeKeywordsPreserveOrder([...seeds, ...phrases]);
 	return merged;
 }
@@ -171,6 +193,114 @@ function runRipgrepPass(
 	});
 }
 
+const OFFLINE_SKIP_DIRS = new Set([
+	"node_modules",
+	".git",
+	"dist",
+	"build",
+	"out",
+	".next",
+	"target",
+	"coverage",
+	".turbo",
+	"__pycache__",
+]);
+const OFFLINE_TEXT_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|json|md|yaml|yml|toml|go|rs|py|java|kt|vue|svelte|css|scss|html|sql|sh)$/i;
+const MAX_OFFLINE_FILES_PER_ROUND = 10_000;
+
+/** When ripgrep cannot be installed (offline / sandbox), scan text files on disk. Slower but avoids total failure. */
+async function runOfflineFsKeywordPass(
+	repoRoot: string,
+	searchRoots: string[],
+	keywords: string[],
+	signal: AbortSignal | undefined,
+): Promise<RipgrepOutcome> {
+	const fileHits = new Map<string, number>();
+	const samples = new Map<string, Array<{ line: number; text: string }>>();
+	const kws = keywords.map((k) => k.trim()).filter((k) => k.length >= 2);
+	if (kws.length === 0) {
+		return { fileHits, samples, stderr: "", exitCode: 0 };
+	}
+
+	let filesVisited = 0;
+
+	async function walkDir(dir: string): Promise<void> {
+		if (signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+		if (filesVisited >= MAX_OFFLINE_FILES_PER_ROUND) {
+			return;
+		}
+		if (!isPathInsideRoot(dir, repoRoot)) {
+			return;
+		}
+		let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean }>;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			if (signal?.aborted) {
+				throw new Error("Operation aborted");
+			}
+			const full = path.join(dir, e.name);
+			if (e.isDirectory()) {
+				if (OFFLINE_SKIP_DIRS.has(e.name)) continue;
+				await walkDir(full);
+			} else if (e.isFile()) {
+				if (!OFFLINE_TEXT_FILE.test(e.name)) continue;
+				if (filesVisited >= MAX_OFFLINE_FILES_PER_ROUND) {
+					return;
+				}
+				filesVisited++;
+				let content: string;
+				try {
+					content = await readFile(full, "utf-8");
+				} catch {
+					continue;
+				}
+				if (content.length > 512 * 1024) {
+					continue;
+				}
+				const lines = content.replace(/\r\n/g, "\n").split("\n");
+				let hits = 0;
+				const localSnips: Array<{ line: number; text: string }> = [];
+				for (let i = 0; i < lines.length; i++) {
+					const line = lines[i] ?? "";
+					const lower = line.toLowerCase();
+					let matched = false;
+					for (const kw of kws) {
+						if (lower.includes(kw.toLowerCase())) {
+							matched = true;
+							break;
+						}
+					}
+					if (matched) {
+						hits++;
+						if (localSnips.length < SNIPPET_LINES) {
+							const t = line.length > 240 ? `${line.slice(0, 240)}…` : line;
+							localSnips.push({ line: i + 1, text: t });
+						}
+					}
+				}
+				if (hits > 0) {
+					fileHits.set(full, (fileHits.get(full) ?? 0) + hits);
+					if (localSnips.length) {
+						samples.set(full, localSnips);
+					}
+				}
+			}
+		}
+	}
+
+	for (const root of searchRoots) {
+		await walkDir(path.resolve(root));
+	}
+
+	return { fileHits, samples, stderr: "", exitCode: 0 };
+}
+
 function formatCall(
 	args: { query?: string; target_directories?: string[] } | undefined,
 	theme: typeof import("../../modes/interactive/theme/theme.js").theme,
@@ -214,8 +344,9 @@ export function createCodebaseSearchToolDefinition(
 	return {
 		name: "codebase_search",
 		label: "codebase_search",
-		description: `Find relevant code via multi-round ripgrep + NLP keyword refinement (5 passes: search → read top-24 hit files → augment keywords loyal to query/explanation → repeat). Returns up to 100 ranked paths with line snippets. Not an embedding index; respects .gitignore.`,
+		description: `Find relevant code via multi-round ripgrep + NLP keyword refinement (8 passes: search → read top-40 hit files per round → augment keywords loyal to query/explanation → repeat). Returns up to 180 ranked paths with line snippets, plus extra path-only overflow. Not an embedding index; respects .gitignore. Call multiple times with different natural-language queries and scopes — first pass often misses files; vary wording and target_directories.`,
 		parameters: codebaseSearchSchema,
+		prepareArguments: prepareCodebaseSearchArguments,
 		async execute(
 			_toolCallId,
 			{
@@ -244,27 +375,60 @@ export function createCodebaseSearchToolDefinition(
 				};
 			}
 
-			const rgPath = await ensureTool("rg", true);
-			if (!rgPath) {
-				throw new Error("ripgrep (rg) is not available and could not be downloaded");
-			}
-
 			const searchRoots =
 				targetDirs?.length && targetDirs.some((d) => d?.trim())
-					? targetDirs.filter((d) => d?.trim()).map((d) => resolveToCwd(d.trim(), cwd))
+					? targetDirs.filter((d) => d?.trim()).map((d) => resolveReadPath(d.trim(), cwd))
 					: [resolveToCwd(".", cwd)];
+
+			const rgPath = await ensureTool("rg", true);
+			let useOfflineSearch = !rgPath;
 
 			const fileLimit = DEFAULT_FILE_LIMIT;
 			const cumulativeHits = new Map<string, number>();
 			const roundSummaries: string[] = [];
 			const mergedSamples = new Map<string, Array<{ line: number; text: string }>>();
 
+			if (useOfflineSearch) {
+				roundSummaries.push(
+					"[Note: ripgrep (rg) is unavailable — using built-in filesystem keyword scan for codebase_search.]",
+				);
+			}
+
 			for (let round = 1; round <= SEARCH_ROUNDS; round++) {
 				if (signal?.aborted) {
 					throw new Error("Operation aborted");
 				}
 
-				const { fileHits, samples, stderr, exitCode } = await runRipgrepPass(rgPath, searchRoots, keywords, signal);
+				let fileHits: Map<string, number>;
+				let samples: Map<string, Array<{ line: number; text: string }>>;
+				let stderr: string;
+				let exitCode: number | null;
+
+				if (useOfflineSearch) {
+					const o = await runOfflineFsKeywordPass(cwd, searchRoots, keywords, signal);
+					fileHits = o.fileHits;
+					samples = o.samples;
+					stderr = o.stderr;
+					exitCode = o.exitCode;
+				} else {
+					try {
+						const o = await runRipgrepPass(rgPath as string, searchRoots, keywords, signal);
+						fileHits = o.fileHits;
+						samples = o.samples;
+						stderr = o.stderr;
+						exitCode = o.exitCode;
+					} catch (err) {
+						useOfflineSearch = true;
+						roundSummaries.push(
+							`[Note: ripgrep failed (${err instanceof Error ? err.message : String(err)}) — using built-in filesystem keyword scan for codebase_search.]`,
+						);
+						const o = await runOfflineFsKeywordPass(cwd, searchRoots, keywords, signal);
+						fileHits = o.fileHits;
+						samples = o.samples;
+						stderr = o.stderr;
+						exitCode = o.exitCode;
+					}
+				}
 
 				for (const [fp, n] of fileHits) {
 					cumulativeHits.set(fp, (cumulativeHits.get(fp) ?? 0) + n);
@@ -317,10 +481,10 @@ export function createCodebaseSearchToolDefinition(
 
 			const sortedByHits = [...cumulativeHits.entries()].sort((a, b) => b[1] - a[1]);
 			const finalRanked = sortedByHits.slice(0, fileLimit);
-			const overflowPaths = sortedByHits.slice(fileLimit, fileLimit + 80);
+			const overflowPaths = sortedByHits.slice(fileLimit, fileLimit + 150);
 
 			const linesOut: string[] = [
-				`Multi-round codebase_search (${SEARCH_ROUNDS} passes, top ${TOP_FILES_TO_READ} files/read per pass for NLP augmentation).`,
+				`Multi-round codebase_search (${SEARCH_ROUNDS} passes, up to ${TOP_FILES_TO_READ} files read per pass for NLP augmentation).`,
 				"Loyalty: augmented terms are weighted toward your query + explanation and co-occurring identifiers in high-hit lines.",
 				"Read every path below that could belong to the task — missing a relevant file loses line-level score.",
 				"",

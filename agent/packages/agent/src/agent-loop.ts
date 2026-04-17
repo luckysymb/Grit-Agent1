@@ -24,6 +24,81 @@ import type {
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
+/** Map Gemini / IDE-shaped tool names to registered Cursor/tau names before lookup. */
+const NORMALIZED_TOOL_NAME_ALIASES: Record<string, string> = {
+	EditEdits: "edit_file",
+	editEdits: "edit_file",
+	edit: "edit_file",
+	Edit: "edit_file",
+	editFile: "edit_file",
+	EditFile: "edit_file",
+	readFile: "read_file",
+	ReadFile: "read_file",
+	listDir: "list_dir",
+	ListDir: "list_dir",
+	list_directory: "list_dir",
+	grep: "grep_search",
+	Grep: "grep_search",
+	grepSearch: "grep_search",
+	GrepSearch: "grep_search",
+	fileSearch: "file_search",
+	FileSearch: "file_search",
+	codebaseSearch: "codebase_search",
+	CodebaseSearch: "codebase_search",
+	searchReplace: "search_replace",
+	SearchReplace: "search_replace",
+	runTerminalCmd: "run_terminal_cmd",
+	RunTerminalCmd: "run_terminal_cmd",
+	run_terminal_command: "run_terminal_cmd",
+	deleteFile: "delete_file",
+	DeleteFile: "delete_file",
+	writeFile: "edit_file",
+	WriteFile: "edit_file",
+	strReplace: "search_replace",
+	StrReplace: "search_replace",
+	str_replace: "search_replace",
+	replace_in_file: "search_replace",
+	ReplaceInFile: "search_replace",
+	readFileContents: "read_file",
+	get_file_contents: "read_file",
+	terminal_command: "run_terminal_cmd",
+	TerminalCommand: "run_terminal_cmd",
+};
+
+/** One-line hint so streamed logs do not inflate duplicate [R] counts. */
+function augmentToolFailureMessage(toolName: string, message: string): string {
+	const m = message.toLowerCase();
+	let hint = "";
+	if (m.includes("validation failed")) {
+		hint = "Use flat JSON with exact schema keys; non-empty required strings.";
+	} else if (m.includes("tool ") && m.includes("not found")) {
+		hint = `Valid tools: read_file, search_replace, edit_file, grep_search, codebase_search, file_search, list_dir, run_terminal_cmd, delete_file, edit_notebook. Got "${toolName}".`;
+	} else if (m.includes("old_string") && (m.includes("times") || m.includes("unique"))) {
+		hint =
+			"search_replace: widen old_string, set replace_all true, or replace_first_match_only true (default).";
+	} else if (m.includes("not found in file")) {
+		hint = "Re-read_file; copy old_string from output without line-number columns.";
+	} else if (m.includes("refusing full-file overwrite") || (toolName === "edit_file" && m.includes("edit_file:"))) {
+		hint = "Use search_replace or edit_file with // ... existing code ... anchors.";
+	} else if (m.includes("identical") || m.includes("must differ")) {
+		hint = "new_string must differ from old_string.";
+	} else if (m.includes("aborted")) {
+		hint = "Retry if the task is not finished.";
+	} else {
+		hint = "Fix args per message; copy file text verbatim.";
+	}
+	return `${message}\n[R] ${hint}`;
+}
+
+function normalizeGeminiToolName(name: string): string {
+	let n = name.trim();
+	const prefixed = n.match(/^(?:functions?|tools?)[./](.+)$/i);
+	if (prefixed?.[1]) {
+		n = prefixed[1].trim();
+	}
+	return NORMALIZED_TOOL_NAME_ALIASES[n] ?? n;
+}
+
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
@@ -154,7 +229,7 @@ function isReadLikeTool(name: string): boolean {
 	return name === "read" || name === "read_file";
 }
 
-/** Tools that only explore the repo — still need a follow-up `edit` to score. */
+/** Tools that only explore the repo — still need a follow-up file mutation (`search_replace`, `edit_file`, or legacy `edit`) to score. */
 function isDiscoveryTool(name: string): boolean {
 	return (
 		isReadLikeTool(name) ||
@@ -174,6 +249,25 @@ function readPathFromToolCall(tc: AgentToolCall): string {
 	if (!a) return "";
 	const p = a.path ?? a.target_file ?? a.file_path;
 	return typeof p === "string" ? p : "";
+}
+
+/** Pi legacy `edit` plus Cursor/tau tools (`edit_file`, `search_replace`, `write`). */
+function isMutationEditTool(name: string): boolean {
+	return name === "edit" || name === "edit_file" || name === "search_replace" || name === "write";
+}
+
+function mutationTargetPathFromToolCall(tc: AgentToolCall): string {
+	const a = tc.arguments as Record<string, unknown> | undefined;
+	if (!a) return "";
+	const p = a.path ?? a.target_file ?? a.file_path;
+	return typeof p === "string" ? p : "";
+}
+
+function failedEditAnchorFromToolCall(tc: AgentToolCall): string {
+	const a = tc.arguments as Record<string, unknown> | undefined;
+	if (!a) return "";
+	const s = a.old_string ?? a.oldText;
+	return typeof s === "string" ? s : "";
 }
 
 /**
@@ -343,11 +437,9 @@ async function runLoop(
 			}
 
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-			// Gemini sometimes hallucinates "EditEdits" or "editEdits" instead of "edit"
+			// Gemini often uses IDE-shaped or wrong tool names; normalize before lookup.
 			for (const tc of toolCalls) {
-				if (tc.name === "EditEdits" || tc.name === "editEdits") {
-					(tc as { name: string }).name = "edit";
-				}
+				(tc as { name: string }).name = normalizeGeminiToolName(tc.name);
 			}
 			hasMoreToolCalls = toolCalls.length > 0;
 
@@ -362,7 +454,7 @@ async function runLoop(
 						(foundFiles[0] ?? "");
 					const concreteEditHint =
 						!tokenCapped && primaryPath
-							? ` Call \`edit\` on \`${primaryPath}\` now — use \`old_string\` copied verbatim from that file (or add a new file with \`write\` if required). Discovery-only turns score zero.`
+							? ` Call \`search_replace\` on \`${primaryPath}\` with \`old_string\` copied verbatim from \`read_file\`, or use \`edit_file\` with \`// ... existing code ...\` placeholders. Discovery-only turns score zero.`
 							: "";
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
@@ -371,8 +463,8 @@ async function runLoop(
 							{
 								type: "text",
 								text: tokenCapped
-									? "Output budget consumed without any tool invocation. Invoke \`read\`/\`read_file\` or \`edit\` now. Text output contributes nothing to your score."
-									: `No file modifications detected. A blank diff receives zero points.${concreteEditHint} Do not reply with prose only — your next message must include an \`edit\` (or \`write\`) tool call.`,
+									? "Output budget consumed without any tool invocation. Invoke \`read_file\`, \`search_replace\`, or \`edit_file\` now. Text output contributes nothing to your score."
+									: `No file modifications detected. A blank diff receives zero points.${concreteEditHint} Do not reply with prose only — your next message must include a \`search_replace\` or \`edit_file\` tool call.`,
 							},
 						],
 						timestamp: Date.now(),
@@ -412,16 +504,16 @@ async function runLoop(
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
 					if (!tc || tc.type !== "toolCall") continue;
-					if (tc.name !== "edit") continue;
-					const targetPath = (tc.arguments as { path?: string } | undefined)?.path;
+					if (!isMutationEditTool(tc.name)) continue;
+					const targetPath = mutationTargetPathFromToolCall(tc);
 					if (!targetPath || typeof targetPath !== "string") continue;
 					if (tr.isError) {
 						const count = (editFailMap.get(targetPath) ?? 0) + 1;
 						editFailMap.set(targetPath, count);
-						const anchorText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
+						const anchorText = failedEditAnchorFromToolCall(tc);
 						const prevAnchor = priorFailedAnchor.get(targetPath);
 						if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical oldText failed twice on \`${targetPath}\`. Use \`read\` to get fresh contents before retrying.` }], timestamp: Date.now() });
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical old_string/oldText failed twice on \`${targetPath}\`. Use \`read_file\` to get fresh contents before retrying.` }], timestamp: Date.now() });
 						}
 						priorFailedAnchor.set(targetPath, anchorText);
 						if (count >= EDIT_FAIL_CEILING && !failNotified.has(targetPath)) {
@@ -431,7 +523,7 @@ async function runLoop(
 								content: [
 									{
 										type: "text",
-										text: `Edit attempts on \`${targetPath}\` have failed ${count} times. Your cached view is stale. Options:\n\n1. Switch to another file from the acceptance criteria you have not edited yet.\n2. Call \`read\` on this file to refresh, then use a compact oldText anchor (under 5 lines).\n3. Only use text you have just read — never paste from memory.`,
+										text: `Edit attempts on \`${targetPath}\` have failed ${count} times. Your cached view is stale. Options:\n\n1. Switch to another file from the acceptance criteria you have not edited yet.\n2. Call \`read_file\` on this file to refresh, then use \`search_replace\` with a compact \`old_string\` (under 5 lines) or \`edit_file\` with correct placeholders.\n3. Only use text you have just read — never paste from memory.`,
 									},
 								],
 								timestamp: Date.now(),
@@ -500,7 +592,7 @@ async function runLoop(
 					if (tr.toolName === "bash" && !tr.isError) {
 						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. All network requests will fail. Proceed with \`read\` and \`edit\` only." }], timestamp: Date.now() });
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. All network requests will fail. Proceed with \`read_file\`, \`search_replace\`, and \`edit_file\` only." }], timestamp: Date.now() });
 							break;
 						}
 					}
@@ -531,7 +623,7 @@ async function runLoop(
 							const path = readPathFromToolCall(tc);
 							if (path) absorbedFiles.add(path);
 						}
-						if (tr.toolName === "edit" && !tr.isError) {
+						if (isMutationEditTool(tr.toolName) && !tr.isError) {
 							workPhase = "apply";
 						}
 					}
@@ -540,7 +632,7 @@ async function runLoop(
 						workPhase = "apply";
 						pendingMessages.push({
 							role: "user",
-							content: [{ type: "text", text: `${absorbedFiles.size} files absorbed. Begin editing the first target file now — invoke \`edit\` directly. Proceed through remaining files until every acceptance criterion is covered.` }],
+							content: [{ type: "text", text: `${absorbedFiles.size} files absorbed. Begin editing the first target file now — invoke \`search_replace\` or \`edit_file\` directly. Proceed through remaining files until every acceptance criterion is covered.` }],
 							timestamp: Date.now(),
 						});
 					}
@@ -577,7 +669,7 @@ async function runLoop(
 								content: [
 									{
 										type: "text",
-										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` on a different file or stop."}`,
+										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`search_replace\` or \`edit_file\` on a different file or stop."}`,
 									},
 								],
 								timestamp: Date.now(),
@@ -617,7 +709,7 @@ async function runLoop(
 						content: [
 							{
 								type: "text",
-								text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`edit\` to the most relevant file now. Even one correct change contributes to your score.`,
+								text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`search_replace\` or \`edit_file\` to the most relevant file now. Even one correct change contributes to your score.`,
 							},
 						],
 						timestamp: Date.now(),
@@ -971,7 +1063,9 @@ async function prepareToolCall(
 	if (!tool) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(
+				augmentToolFailureMessage(toolCall.name, `Tool "${toolCall.name}" not found`),
+			),
 			isError: true,
 		};
 	}
@@ -1004,9 +1098,10 @@ async function prepareToolCall(
 			args: validatedArgs,
 		};
 	} catch (error) {
+		const raw = error instanceof Error ? error.message : String(error);
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(augmentToolFailureMessage(tool.name, raw)),
 			isError: true,
 		};
 	}
@@ -1042,8 +1137,9 @@ async function executePreparedToolCall(
 		return { result, isError: false };
 	} catch (error) {
 		await Promise.all(updateEvents);
+		const raw = error instanceof Error ? error.message : String(error);
 		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(augmentToolFailureMessage(prepared.toolCall.name, raw)),
 			isError: true,
 		};
 	}

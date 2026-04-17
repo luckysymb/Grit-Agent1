@@ -1,71 +1,8 @@
 /**
  * Built-in tools aligned with tau/Cursor_Tools.json (Cursor-compatible names/parameters).
- * Legacy pi tools (read, bash, edit, write, grep, find, ls) remain available as exports from their modules for callers that import them directly.
  */
-export {
-	type BashOperations,
-	type BashSpawnContext,
-	type BashSpawnHook,
-	type BashToolDetails,
-	type BashToolInput,
-	type BashToolOptions,
-	bashTool,
-	bashToolDefinition,
-	createBashTool,
-	createBashToolDefinition,
-	createLocalBashOperations,
-} from "./bash.js";
-export {
-	createEditTool,
-	createEditToolDefinition,
-	type EditOperations,
-	type EditToolDetails,
-	type EditToolInput,
-	type EditToolOptions,
-	editTool,
-	editToolDefinition,
-} from "./edit.js";
+export { type BashOperations, createLocalBashOperations } from "./bash-operations.js";
 export { withFileMutationQueue } from "./file-mutation-queue.js";
-export {
-	createFindTool,
-	createFindToolDefinition,
-	type FindOperations,
-	type FindToolDetails,
-	type FindToolInput,
-	type FindToolOptions,
-	findTool,
-	findToolDefinition,
-} from "./find.js";
-export {
-	createGrepTool,
-	createGrepToolDefinition,
-	type GrepOperations,
-	type GrepToolDetails,
-	type GrepToolInput,
-	type GrepToolOptions,
-	grepTool,
-	grepToolDefinition,
-} from "./grep.js";
-export {
-	createLsTool,
-	createLsToolDefinition,
-	type LsOperations,
-	type LsToolDetails,
-	type LsToolInput,
-	type LsToolOptions,
-	lsTool,
-	lsToolDefinition,
-} from "./ls.js";
-export {
-	createReadTool,
-	createReadToolDefinition,
-	type ReadOperations,
-	type ReadToolDetails,
-	type ReadToolInput,
-	type ReadToolOptions,
-	readTool,
-	readToolDefinition,
-} from "./read.js";
 export {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -76,15 +13,6 @@ export {
 	truncateLine,
 	truncateTail,
 } from "./truncate.js";
-export {
-	createWriteTool,
-	createWriteToolDefinition,
-	type WriteOperations,
-	type WriteToolInput,
-	type WriteToolOptions,
-	writeTool,
-	writeToolDefinition,
-} from "./write.js";
 
 export {
 	codebaseSearchTool,
@@ -112,6 +40,7 @@ export {
 	createReadFileToolDefinition,
 	readFileTool,
 	readFileToolDefinition,
+	type ReadFileToolDetails,
 	type ReadFileToolInput,
 } from "./read-file.js";
 export {
@@ -119,6 +48,7 @@ export {
 	createRunTerminalCmdToolDefinition,
 	runTerminalCmdTool,
 	runTerminalCmdToolDefinition,
+	type RunTerminalCmdToolDetails,
 	type RunTerminalCmdToolInput,
 } from "./run-terminal-cmd.js";
 export {
@@ -232,8 +162,6 @@ import {
 	editNotebookTool,
 	editNotebookToolDefinition,
 } from "./edit-notebook.js";
-import type { ReadToolOptions } from "./read.js";
-import type { BashToolOptions } from "./bash.js";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
@@ -287,10 +215,8 @@ export const readOnlyTools: Tool[] = [
 	reapplyTool,
 ];
 
-export interface ToolsOptions {
-	read?: ReadToolOptions;
-	bash?: BashToolOptions;
-}
+/** Reserved for future per-factory options. */
+export interface ToolsOptions {}
 
 export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
 	return [

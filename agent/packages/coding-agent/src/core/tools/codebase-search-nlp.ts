@@ -84,8 +84,8 @@ export const NLP_STOP = new Set([
 	"look",
 ]);
 
-const MAX_SEED = 22;
-const MAX_TOTAL_KEYWORDS = 52;
+const MAX_SEED = 30;
+const MAX_TOTAL_KEYWORDS = 68;
 function cleanForTokens(raw: string): string {
 	return raw.replace(/[`'"[\](){}]/g, " ");
 }

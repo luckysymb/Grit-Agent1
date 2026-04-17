@@ -8,7 +8,8 @@ import { Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
-import { resolveToCwd } from "./path-utils.js";
+import { asRecord, firstString } from "./flexible-tool-args.js";
+import { dedupeAppRouterRouteGroupSegment, resolveReadPath } from "./path-utils.js";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "./truncate.js";
@@ -26,15 +27,37 @@ const listDirSchema = Type.Object({
 
 export type ListDirToolInput = Static<typeof listDirSchema>;
 
-const ENTRY_LIMIT = 2000;
+const ENTRY_LIMIT = 5000;
+
+function prepareListDirArguments(raw: unknown): ListDirToolInput {
+	const o = asRecord(raw);
+	let relative_workspace_path =
+		firstString(o, [
+			"relative_workspace_path",
+			"path",
+			"directory",
+			"dir",
+			"folder",
+			"target",
+			"workspace_path",
+		]) ?? ".";
+	relative_workspace_path = dedupeAppRouterRouteGroupSegment(relative_workspace_path.replace(/\\/g, "/"));
+	const explanation = firstString(o, ["explanation", "reason", "purpose"]);
+	const out: ListDirToolInput = { relative_workspace_path };
+	if (explanation !== undefined) {
+		out.explanation = explanation;
+	}
+	return out;
+}
 
 export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof listDirSchema, undefined> {
 	return {
 		name: "list_dir",
 		label: "list_dir",
 		description:
-			"List the contents of a directory (non-dot entries; up to 2000 entries). Use for breadth-first discovery across packages before searching or reading files.",
+			"List the contents of a directory (non-dot entries; up to 5000 entries). Use for breadth-first discovery across packages before searching or reading files.",
 		parameters: listDirSchema,
+		prepareArguments: prepareListDirArguments,
 		async execute(
 			_toolCallId,
 			args: { relative_workspace_path: string; explanation?: string },
@@ -42,7 +65,7 @@ export function createListDirToolDefinition(cwd: string): ToolDefinition<typeof 
 			_onUpdate,
 			_ctx: ExtensionContext,
 		) {
-			const abs = resolveToCwd(args.relative_workspace_path, cwd);
+			const abs = resolveReadPath(args.relative_workspace_path, cwd);
 			if (!existsSync(abs)) {
 				throw new Error(`Path not found: ${args.relative_workspace_path}`);
 			}

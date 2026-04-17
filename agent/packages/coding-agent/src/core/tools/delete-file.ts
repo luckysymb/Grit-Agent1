@@ -5,7 +5,8 @@ import { existsSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
-import { resolveToCwd } from "./path-utils.js";
+import { asRecord, firstString } from "./flexible-tool-args.js";
+import { dedupeAppRouterRouteGroupSegment, resolveReadPath } from "./path-utils.js";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -22,6 +23,19 @@ const deleteFileSchema = Type.Object({
 
 export type DeleteFileToolInput = Static<typeof deleteFileSchema>;
 
+function prepareDeleteFileArguments(raw: unknown): DeleteFileToolInput {
+	const o = asRecord(raw);
+	let target_file =
+		firstString(o, ["target_file", "path", "file", "file_path", "filepath", "filename"]) ?? "";
+	target_file = dedupeAppRouterRouteGroupSegment(target_file.replace(/\\/g, "/"));
+	const explanation = firstString(o, ["explanation", "reason", "purpose"]);
+	const out: DeleteFileToolInput = { target_file };
+	if (explanation !== undefined) {
+		out.explanation = explanation;
+	}
+	return out;
+}
+
 function isInsideRoot(root: string, target: string): boolean {
 	const r = path.resolve(root);
 	const t = path.resolve(target);
@@ -36,6 +50,7 @@ export function createDeleteFileToolDefinition(cwd: string): ToolDefinition<type
 		description:
 			"Delete a file in the workspace. Fails if the path is outside the workspace, is a directory, or does not exist.",
 		parameters: deleteFileSchema,
+		prepareArguments: prepareDeleteFileArguments,
 		async execute(
 			_toolCallId,
 			{ target_file }: { target_file: string; explanation?: string },
@@ -43,7 +58,7 @@ export function createDeleteFileToolDefinition(cwd: string): ToolDefinition<type
 			_onUpdate,
 			_ctx: ExtensionContext,
 		) {
-			const abs = resolveToCwd(target_file, cwd);
+			const abs = resolveReadPath(target_file, cwd);
 			if (!isInsideRoot(cwd, abs)) {
 				throw new Error(`Refusing to delete outside workspace: ${target_file}`);
 			}

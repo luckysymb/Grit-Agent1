@@ -73,8 +73,11 @@ const TOOLS: Record<string, ToolConfig> = {
 function commandExists(cmd: string): boolean {
 	try {
 		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
-		// Check for ENOENT error (command not found)
-		return result.error === undefined || result.error === null;
+		if (result.error) {
+			return false;
+		}
+		// Wrong-arch or broken binaries may exit non-zero; do not treat as available.
+		return result.status === 0;
 	} catch {
 		return false;
 	}

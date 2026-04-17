@@ -7,10 +7,18 @@ import { type Static, Type } from "@sinclair/typebox";
 import { existsSync } from "fs";
 import { readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
-import { resolveToCwd } from "./path-utils.js";
+import { firstString } from "./flexible-tool-args.js";
+import { dedupeAppRouterRouteGroupSegment, resolveReadPath } from "./path-utils.js";
 import { str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
-import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./edit-diff.js";
+import {
+	detectLineEnding,
+	normalizeForFuzzyMatch,
+	normalizeToLF,
+	restoreLineEndings,
+	stripBom,
+	stripReadFileLineNumberPrefixes,
+} from "./edit-diff.js";
 
 const editFileSchema = Type.Object({
 	target_file: Type.String({
@@ -28,6 +36,19 @@ const editFileSchema = Type.Object({
 });
 
 export type CursorEditFileToolInput = Static<typeof editFileSchema>;
+
+/** LLMs often send Cursor- or IDE-shaped keys; normalize before schema validation. */
+function prepareCursorEditFileArguments(raw: unknown): CursorEditFileToolInput {
+	const o = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+	let target_file =
+		firstString(o, ["target_file", "file_path", "path", "file", "filename", "filepath"]) ?? "";
+	target_file = dedupeAppRouterRouteGroupSegment(target_file.replace(/\\/g, "/"));
+	const code_edit =
+		firstString(o, ["code_edit", "code", "contents", "content", "patch", "new_code"]) ?? "";
+	const instructions =
+		firstString(o, ["instructions", "instruction", "description", "summary"]) ?? "Apply the edit in code_edit.";
+	return { target_file, instructions, code_edit };
+}
 
 function isPlaceholderLine(line: string): boolean {
 	const t = line.trim();
@@ -59,8 +80,9 @@ export function createCursorEditFileToolDefinition(cwd: string): ToolDefinition<
 		name: "edit_file",
 		label: "edit_file",
 		description:
-			"Apply a sketch edit. New file: writes code_edit (placeholder lines removed). Existing file: with two placeholder blocks, replaces the region of the original file between the first and last non-placeholder segments (head/tail anchors). Without placeholders, overwrites the file with code_edit.",
+			"Apply a sketch edit. New file: writes code_edit (placeholder lines removed). Existing file: use // ... existing code ... (or # / HTML comment equivalents) as standalone lines. One placeholder: anchors head above and tail below — the file region between those anchors is replaced with nothing (use for deletions/collapsing). Two placeholders: head, new middle, tail — middle replaces content between anchors. Without placeholders, overwrites the file. Prefer search_replace for small exact replacements after read_file.",
 		parameters: editFileSchema,
+		prepareArguments: prepareCursorEditFileArguments,
 		async execute(
 			_toolCallId,
 			args: { target_file: string; instructions: string; code_edit: string },
@@ -68,8 +90,8 @@ export function createCursorEditFileToolDefinition(cwd: string): ToolDefinition<
 			_onUpdate,
 			_ctx: ExtensionContext,
 		) {
-			const abs = resolveToCwd(args.target_file, cwd);
-			const sketch = args.code_edit.replace(/\r\n/g, "\n");
+			const abs = resolveReadPath(args.target_file, cwd);
+			const sketch = stripReadFileLineNumberPrefixes(args.code_edit.replace(/\r\n/g, "\n"));
 			const segs = segmentsFromSketch(sketch);
 			const hasPh = sketch.split("\n").some(isPlaceholderLine);
 
@@ -90,8 +112,24 @@ export function createCursorEditFileToolDefinition(cwd: string): ToolDefinition<
 				return { content: [{ type: "text", text: `Overwrote ${args.target_file}` }], details: undefined };
 			}
 
+			// One placeholder → [head, tail]: replace the span between anchors with nothing (collapse / delete between).
+			// Two or more placeholders → head, first middle, tail (unchanged middle block).
+			if (segs.length === 2) {
+				const merged2 = mergeHeadMidTail(normalized, segs[0], "", segs[1]);
+				if (merged2 === null) {
+					throw new Error(
+						"edit_file: could not anchor head/tail with one // ... existing code ... line. Add a second placeholder around new middle code, or use search_replace with exact old_string.",
+					);
+				}
+				if (signal?.aborted) throw new Error("aborted");
+				await fsWriteFile(abs, bom + restoreLineEndings(merged2, le), "utf-8");
+				return { content: [{ type: "text", text: `Edited ${args.target_file}` }], details: undefined };
+			}
+
 			if (segs.length < 3) {
-				throw new Error("edit_file: use two // ... existing code ... lines to delimit head, middle, tail segments, or use search_replace.");
+				throw new Error(
+					"edit_file: use one // ... existing code ... line between head and tail, or two such lines around the middle segment to replace, or use search_replace.",
+				);
 			}
 
 			const head = segs[0];
@@ -118,10 +156,43 @@ function mergeHeadMidTail(orig: string, head: string, mid: string, tail: string)
 	const h = head.trimEnd();
 	const t = tail.trimStart();
 	const i0 = orig.indexOf(h);
-	if (i0 === -1) return null;
-	const i1 = orig.lastIndexOf(t);
-	if (i1 === -1 || i1 < i0 + h.length) return null;
-	return orig.slice(0, i0 + h.length) + mid + orig.slice(i1);
+	if (i0 !== -1) {
+		const i1 = orig.lastIndexOf(t);
+		if (i1 !== -1 && i1 >= i0 + h.length) {
+			return orig.slice(0, i0 + h.length) + mid + orig.slice(i1);
+		}
+	}
+	// Second pass: quotes/whitespace/unicode drift (same helper as search_replace fuzzy path)
+	const o = normalizeForFuzzyMatch(orig);
+	const hf = normalizeForFuzzyMatch(h);
+	const tf = normalizeForFuzzyMatch(t);
+	const mf = normalizeForFuzzyMatch(mid);
+	if (!hf.length || !tf.length) return null;
+	const fi0 = o.indexOf(hf);
+	const fi1 = o.lastIndexOf(tf);
+	if (fi0 !== -1 && fi1 !== -1 && fi1 >= fi0 + hf.length) {
+		return o.slice(0, fi0 + hf.length) + mf + o.slice(fi1);
+	}
+	// Last resort: first substantial line of head + last substantial line of tail (models often drift on middle lines)
+	const hLine = head.split("\n").find((l) => l.trim().length > 0)?.trimEnd() ?? "";
+	const tLine = [...tail.split("\n")].reverse().find((l) => l.trim().length > 0)?.trimStart() ?? "";
+	const minLine = 10;
+	if (hLine.length >= minLine && tLine.length >= minLine) {
+		const li0 = orig.indexOf(hLine);
+		const li1 = orig.lastIndexOf(tLine);
+		if (li0 !== -1 && li1 !== -1 && li1 >= li0 + hLine.length) {
+			return orig.slice(0, li0 + hLine.length) + mid + orig.slice(li1);
+		}
+		const hN = normalizeForFuzzyMatch(hLine);
+		const tN = normalizeForFuzzyMatch(tLine);
+		const oo = normalizeForFuzzyMatch(orig);
+		const mi0 = oo.indexOf(hN);
+		const mi1 = oo.lastIndexOf(tN);
+		if (mi0 !== -1 && mi1 !== -1 && mi1 >= mi0 + hN.length) {
+			return oo.slice(0, mi0 + hN.length) + normalizeForFuzzyMatch(mid) + oo.slice(mi1);
+		}
+	}
+	return null;
 }
 
 export function createCursorEditFileTool(cwd: string): AgentTool {
