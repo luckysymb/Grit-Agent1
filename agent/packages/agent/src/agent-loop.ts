@@ -75,7 +75,10 @@ function augmentToolFailureMessage(toolName: string, message: string): string {
 		hint = `Valid tools: read_file, search_replace, edit_file, grep_search, codebase_search, file_search, list_dir, run_terminal_cmd, delete_file, edit_notebook. Got "${toolName}".`;
 	} else if (m.includes("old_string") && (m.includes("times") || m.includes("unique"))) {
 		hint =
-			"search_replace: widen old_string, set replace_all true, or replace_first_match_only true (default).";
+			"search_replace: narrow old_string to a unique span (once), or set replace_all: true / replace_first_match_only: true.";
+	} else if (m.includes("old_string") && m.includes("not found")) {
+		hint =
+			"read_file file_path; copy old_string verbatim from output. If only quotes/whitespace differ, allow_fuzzy_match: true once.";
 	} else if (m.includes("not found in file")) {
 		hint = "Re-read_file; copy old_string from output without line-number columns.";
 	} else if (m.includes("refusing full-file overwrite") || (toolName === "edit_file" && m.includes("edit_file:"))) {
@@ -229,37 +232,70 @@ function isReadLikeTool(name: string): boolean {
 	return name === "read" || name === "read_file";
 }
 
-/** Tools that only explore the repo — still need a follow-up file mutation (`search_replace`, `edit_file`, or legacy `edit`) to score. */
+/** `bash` (pi) and `run_terminal_cmd` (Cursor/tau). */
+function isShellLikeTool(name: string): boolean {
+	return name === "bash" || name === "run_terminal_cmd";
+}
+
+/** Tools that may shell out to fd/rg — offline/minimal images can fail and need bash fallback. */
+function isRipgrepBackedSearchTool(name: string): boolean {
+	return name === "grep_search" || name === "file_search" || name === "codebase_search" || name === "grep" || name === "find";
+}
+
+function toolResultErrorText(tr: ToolResultMessage): string {
+	return tr.content?.map((c) => (c as { text?: string }).text ?? "").join("") ?? "";
+}
+
+function toolCallRecordArgs(tc: AgentToolCall): Record<string, unknown> {
+	const a = tc.arguments;
+	return a && typeof a === "object" && !Array.isArray(a) ? (a as Record<string, unknown>) : {};
+}
+
+/** Tools that only explore the repo — still need a follow-up mutation (`search_replace`, `edit_file`, etc.) to score. */
 function isDiscoveryTool(name: string): boolean {
 	return (
 		isReadLikeTool(name) ||
-		name === "bash" ||
+		isShellLikeTool(name) ||
 		name === "ls" ||
 		name === "list_dir" ||
 		name === "grep" ||
 		name === "grep_search" ||
 		name === "find" ||
 		name === "file_search" ||
-		name === "codebase_search"
+		name === "codebase_search" ||
+		name === "reapply"
 	);
 }
 
 function readPathFromToolCall(tc: AgentToolCall): string {
 	const a = tc.arguments as Record<string, unknown> | undefined;
 	if (!a) return "";
-	const p = a.path ?? a.target_file ?? a.file_path;
+	const p =
+		a.target_file ??
+		a.path ??
+		a.file_path ??
+		a.relative_workspace_path ??
+		a.directory ??
+		a.dir;
 	return typeof p === "string" ? p : "";
 }
 
-/** Pi legacy `edit` plus Cursor/tau tools (`edit_file`, `search_replace`, `write`). */
+/** Pi legacy `edit` plus Cursor/tau tools from `coding-agent` `allTools`. */
 function isMutationEditTool(name: string): boolean {
-	return name === "edit" || name === "edit_file" || name === "search_replace" || name === "write";
+	return (
+		name === "edit" ||
+		name === "edit_file" ||
+		name === "search_replace" ||
+		name === "write" ||
+		name === "delete_file" ||
+		name === "edit_notebook"
+	);
 }
 
 function mutationTargetPathFromToolCall(tc: AgentToolCall): string {
 	const a = tc.arguments as Record<string, unknown> | undefined;
 	if (!a) return "";
-	const p = a.path ?? a.target_file ?? a.file_path;
+	const p = a.file_path ?? a.path ?? a.target_file ?? a.target_notebook;
 	return typeof p === "string" ? p : "";
 }
 
@@ -294,9 +330,11 @@ async function runLoop(
 	const priorFailedAnchor = new Map<string, string>();
 
 	let explorationCount = 0;
+	let totalExplorationSteps = 0;
 	let hasProducedEdit = false;
 	let emptyTurnRetries = 0;
 	const EMPTY_TURN_MAX = 7;
+	const ZERO_DIFF_AFTER_EMPTY_TURNS = 2;
 	/** Last files successfully read (read / read_file); used when the model returns empty turns. */
 	let recentReadPaths: string[] = [];
 
@@ -339,7 +377,7 @@ async function runLoop(
 	};
 
 	// Extract expected files from system prompt or initial messages
-	const systemPromptText = (currentContext as any).systemPrompt || "";
+	const systemPromptText = currentContext.systemPrompt || "";
 	let expectedFiles: string[] = parseExpectedFiles(systemPromptText);
 	if (expectedFiles.length === 0) {
 		for (const msg of currentContext.messages) {
@@ -376,10 +414,77 @@ async function runLoop(
 	};
 	const EARLY_NUDGE_MS = 10_000;
 	const URGENT_NUDGE_MS = 22_000;
+	const FORCE_EDIT_MS = 45_000;
 	const LATE_NUDGE_MS = 55_000;
 	const GRACEFUL_EXIT_MS = 170_000;
 	let multiFileHintSent = false;
 	let reviewPassDone = false;
+	let forceEdit45Sent = false;
+
+	// Optional: merge git diff paths vs base ref into discovery targets (King / v142).
+	try {
+		const { spawnSync: gitSpawn } = await import("node:child_process");
+		const gitCwd = process.cwd();
+		const runGit = (args: string[]) => {
+			try {
+				const r = gitSpawn("git", args, { cwd: gitCwd, timeout: 3000, encoding: "utf-8" });
+				return r.status === 0 ? (r.stdout || "").trim() : "";
+			} catch {
+				return "";
+			}
+		};
+		const head = runGit(["rev-parse", "HEAD"]);
+		const refs = runGit(["for-each-ref", "--format=%(objectname)%09%(refname)"]);
+		if (head && refs) {
+			let refSha = "";
+			for (const line of refs.split("\n")) {
+				const [sha, name] = line.split("\t");
+				if (sha && sha !== head && name && (name.includes("/main") || name.includes("/master"))) {
+					refSha = sha;
+					break;
+				}
+			}
+			if (!refSha) {
+				for (const line of refs.split("\n")) {
+					const [sha, name] = line.split("\t");
+					if (sha && sha !== head && name) {
+						refSha = sha;
+						break;
+					}
+				}
+			}
+			if (refSha) {
+				const dt = runGit(["diff-tree", "--raw", "--no-renames", "-r", head, refSha]);
+				const changedPaths: string[] = [];
+				for (const dl of dt.split("\n")) {
+					const dm = dl.match(/^:\d+ \d+ [0-9a-f]+ [0-9a-f]+ ([AMD])\t(.+)$/);
+					if (!dm) continue;
+					if (dm[1] === "A" || dm[1] === "M") changedPaths.push(dm[2]);
+				}
+				if (changedPaths.length > 0 && changedPaths.length <= 20) {
+					const norm = (s: string) => s.replace(/^\.\//, "");
+					let toMerge = changedPaths;
+					if (expectedFiles.length > 0) {
+						toMerge = changedPaths.filter((p) => {
+							const np = norm(p);
+							return expectedFiles.some((e) => {
+								const ne = norm(e);
+								return np === ne || np.endsWith("/" + ne) || ne.endsWith("/" + np);
+							});
+						});
+					}
+					if (toMerge.length > 0) {
+						const merged = new Set([...foundFiles, ...toMerge, ...expectedFiles]);
+						foundFiles = [...merged];
+						expectedFiles = [...merged];
+						workPhase = "absorb";
+					}
+				}
+			}
+		}
+	} catch {
+		/* not a git repo or git unavailable */
+	}
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -457,18 +562,38 @@ async function runLoop(
 							? ` Call \`search_replace\` on \`${primaryPath}\` with \`old_string\` copied verbatim from \`read_file\`, or use \`edit_file\` with \`// ... existing code ...\` placeholders. Discovery-only turns score zero.`
 							: "";
 					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: tokenCapped
-									? "Output budget consumed without any tool invocation. Invoke \`read_file\`, \`search_replace\`, or \`edit_file\` now. Text output contributes nothing to your score."
-									: `No file modifications detected. A blank diff receives zero points.${concreteEditHint} Do not reply with prose only — your next message must include a \`search_replace\` or \`edit_file\` tool call.`,
-							},
-						],
-						timestamp: Date.now(),
-					});
+					if (
+						idleStopped &&
+						!tokenCapped &&
+						pathsAlreadyRead.size > 0 &&
+						emptyTurnRetries >= ZERO_DIFF_AFTER_EMPTY_TURNS
+					) {
+						emptyTurnRetries = 0;
+						const topFile = foundFiles[0] || primaryPath || "";
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `You are about to finish with ZERO edits. This guarantees a loss. You read \`${topFile}\`. Apply \`search_replace\` or \`edit_file\` to it now — even a partial change scores more than nothing.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					} else {
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: tokenCapped
+										? "Output budget consumed without any tool invocation. Invoke \`read_file\`, \`search_replace\`, or \`edit_file\` now. Text output contributes nothing to your score."
+										: `No file modifications detected. A blank diff receives zero points.${concreteEditHint} Do not reply with prose only — your next message must include a \`search_replace\`, \`edit_file\`, or \`delete_file\` tool call if the task requires it.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					}
 					continue;
 				}
 			}
@@ -511,8 +636,48 @@ async function runLoop(
 						const count = (editFailMap.get(targetPath) ?? 0) + 1;
 						editFailMap.set(targetPath, count);
 						const anchorText = failedEditAnchorFromToolCall(tc);
+						const errText = toolResultErrorText(tr);
 						const prevAnchor = priorFailedAnchor.get(targetPath);
-						if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0) {
+						if (errText.includes("2 occurrences") || errText.includes("3 occurrences")) {
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `Edit failed: anchor matches multiple locations in \`${targetPath}\`. Widen \`old_string\`/\`oldText\` with more surrounding lines so it is unique, or use \`search_replace\` \`replace_all\` when appropriate. Use \`read_file\` for exact context.`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+						} else if (errText.includes("must have required property") || errText.includes("Validation failed")) {
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `Edit schema error on \`${targetPath}\`. Use flat JSON with exact keys for this tool (\`search_replace\`: file_path, old_string, new_string; \`edit_file\`: target_file, instructions, code_edit). Re-read the tool definition and retry.`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+						} else if (
+							(errText.includes("Could not find") ||
+								errText.includes("not found in file") ||
+								errText.includes("Old string not found")) &&
+							!pathsAlreadyRead.has(targetPath) &&
+							pendingMessages.length === 0
+						) {
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `Edit failed on \`${targetPath}\` — your anchor does not match the file. Call \`read_file\` on \`${targetPath}\` first, then copy the exact text into \`old_string\`/\`oldText\`.`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+						} else if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0) {
 							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical old_string/oldText failed twice on \`${targetPath}\`. Use \`read_file\` to get fresh contents before retrying.` }], timestamp: Date.now() });
 						}
 						priorFailedAnchor.set(targetPath, anchorText);
@@ -535,6 +700,7 @@ async function runLoop(
 						const firstEdit = !hasProducedEdit;
 						hasProducedEdit = true;
 						explorationCount = 0;
+						totalExplorationSteps = 0;
 						const normTarget = targetPath.replace(/^\.\//, "");
 						editedPaths.add(targetPath);
 						editedPaths.add(normTarget);
@@ -558,12 +724,48 @@ async function runLoop(
 						} else if (uneditedTargets.length > 0) {
 							breadthHint = ` ${uneditedTargets.length} target file(s) still need edits: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Move to the next unedited file — breadth across files scores higher than depth in one file.`;
 						}
+						let siblingHint = "";
+						try {
+							const { spawnSync: sibSpawn } = await import("node:child_process");
+							const dir = normTarget.includes("/") ? normTarget.substring(0, normTarget.lastIndexOf("/")) : ".";
+							const ext = normTarget.includes(".") ? normTarget.substring(normTarget.lastIndexOf(".")) : "";
+							const lsResult = sibSpawn("ls", [dir], { cwd: process.cwd(), timeout: 1000, encoding: "utf-8" });
+							if (lsResult.status === 0 && lsResult.stdout) {
+								const siblings = lsResult.stdout
+									.trim()
+									.split("\n")
+									.map((f: string) => (dir === "." ? f : `${dir}/${f}`))
+									.filter((f: string) => !editedPaths.has(f) && !editedPaths.has(f.replace(/^\.\//, "")));
+								const related = siblings
+									.filter((f: string) => {
+										const name = f.split("/").pop() || "";
+										return (
+											name.includes(".test.") ||
+											name.includes(".spec.") ||
+											name.includes("_test.") ||
+											name.includes(".freezed.") ||
+											name.includes(".g.") ||
+											name.includes(".generated.") ||
+											(ext.length > 0 && f.endsWith(ext))
+										);
+									})
+									.slice(0, 5);
+								if (related.length > 0) {
+									for (const rf of related) {
+										if (!foundFiles.includes(rf)) foundFiles.push(rf);
+									}
+									siblingHint = ` Siblings: ${related.map((f: string) => `\`${f}\``).join(", ")}.`;
+								}
+							}
+						} catch {
+							/* ignore sibling listing failures */
+						}
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `\`${targetPath}\` updated successfully.${breadthHint}`,
+									text: `\`${targetPath}\` updated successfully.${breadthHint}${siblingHint}`,
 								},
 							],
 							timestamp: Date.now(),
@@ -589,7 +791,7 @@ async function runLoop(
 				}
 
 				for (const tr of toolResults) {
-					if (tr.toolName === "bash" && !tr.isError) {
+					if (isShellLikeTool(tr.toolName) && !tr.isError) {
 						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
 							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. All network requests will fail. Proceed with \`read_file\`, \`search_replace\`, and \`edit_file\` only." }], timestamp: Date.now() });
@@ -598,9 +800,60 @@ async function runLoop(
 					}
 				}
 
+				for (let gi = 0; gi < toolResults.length; gi++) {
+					const tr = toolResults[gi];
+					const gtc = toolCalls[gi];
+					if (!gtc || gtc.type !== "toolCall" || !isRipgrepBackedSearchTool(tr.toolName) || !tr.isError) continue;
+					const errG = toolResultErrorText(tr);
+					if (
+						!errG.includes("fd is not available") &&
+						!errG.includes("ripgrep") &&
+						!errG.includes("not available") &&
+						!errG.toLowerCase().includes("offline")
+					) {
+						continue;
+					}
+					const args = toolCallRecordArgs(gtc);
+					let bashCmd = "";
+					if (tr.toolName === "file_search") {
+						const q = (typeof args.query === "string" && args.query) || "*";
+						const safe = String(q).replace(/"/g, '\\"');
+						bashCmd = `find . -type f -iname "*${safe}*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | head -30`;
+					} else if (tr.toolName === "codebase_search") {
+						const rawQ = (typeof args.query === "string" && args.query) || "";
+						const q = rawQ.split("\n")[0].slice(0, 120).replace(/"/g, '\\"');
+						const dirs = args.target_directories;
+						const scope =
+							Array.isArray(dirs) && dirs.length > 0 && typeof dirs[0] === "string" ? dirs[0] : ".";
+						bashCmd = `grep -rnl --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist -F "${q}" ${scope} | head -25`;
+					} else {
+						const pattern =
+							(typeof args.query === "string" && args.query) ||
+							(typeof args.pattern === "string" && args.pattern) ||
+							"";
+						const searchPath = (typeof args.path === "string" && args.path) || ".";
+						const include =
+							typeof args.include_pattern === "string" && args.include_pattern
+								? `--include="${String(args.include_pattern).replace(/"/g, '\\"')}"`
+								: "";
+						const safePat = String(pattern).replace(/"/g, '\\"');
+						bashCmd = `grep -rnl ${include} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist "${safePat}" ${searchPath} | head -20`;
+					}
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `The ${tr.toolName} tool failed in this environment. Use \`run_terminal_cmd\` (or legacy \`bash\`) instead:\n\`\`\`\n${bashCmd}\n\`\`\`\nRun this now.`,
+							},
+						],
+						timestamp: Date.now(),
+					});
+				}
+
 				if (workPhase === "search") {
 					for (const tr of toolResults) {
-						if (tr.toolName === "bash" && !tr.isError) {
+						if (isShellLikeTool(tr.toolName) && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 							const paths = output.split("\n").filter((l: string) => l.trim().match(/\.\w+$/)).map((l: string) => l.trim());
 							if (paths.length > 0) {
@@ -642,7 +895,10 @@ async function runLoop(
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
 					if (isDiscoveryTool(tr.toolName) && !tr.isError) {
-						if (!hasProducedEdit) explorationCount++;
+						if (!hasProducedEdit) {
+							explorationCount++;
+							totalExplorationSteps++;
+						}
 					}
 					if (isReadLikeTool(tr.toolName) && !tr.isError && tc && tc.type === "toolCall") {
 						const readPath = readPathFromToolCall(tc);
@@ -686,12 +942,32 @@ async function runLoop(
 						content: [
 							{
 								type: "text",
-								text: `Context gathered (${explorationCount} reads/bashes). Apply your first edit to the highest-priority target file now. A partial patch always outscores an empty diff.`,
+								text: `Context gathered (${explorationCount} discovery tool calls). Apply your first \`search_replace\`/\`edit_file\` to the highest-priority target file now. A partial patch always outscores an empty diff.`,
 							},
 						],
 						timestamp: Date.now(),
 					});
 					explorationCount = 0;
+				}
+
+				if (
+					!hasProducedEdit &&
+					totalExplorationSteps >= 5 &&
+					pendingMessages.length === 0 &&
+					foundFiles.length > 0
+				) {
+					const primary = foundFiles[0].replace(/^\.\//, "");
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `Discovery stall: ${totalExplorationSteps} read/search/list steps with no successful mutation yet. Top-ranked target is \`${primary}\` — \`read_file\` if needed, then \`search_replace\` or \`edit_file\` immediately. Avoid more broad listing.`,
+							},
+						],
+						timestamp: Date.now(),
+					});
+					totalExplorationSteps = 0;
 				}
 			}
 
@@ -726,6 +1002,22 @@ async function runLoop(
 						],
 						timestamp: Date.now(),
 					});
+				}
+				if (!forceEdit45Sent && elapsed >= FORCE_EDIT_MS && pathsAlreadyRead.size > 0) {
+					forceEdit45Sent = true;
+					const topFile = foundFiles[0] || [...pathsAlreadyRead][0] || "";
+					if (topFile) {
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `CRITICAL: ${Math.round(elapsed / 1000)}s elapsed with ZERO successful mutations. An empty diff scores zero. You have read \`${topFile}\`. Call \`search_replace\` or \`edit_file\` on it now — do NOT spend more turns on discovery only.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					}
 				}
 			}
 
@@ -766,7 +1058,7 @@ async function runLoop(
 					content: [
 						{
 							type: "text",
-							text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply \`edit\` now — further discovery has diminishing returns.",
+							text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply \`search_replace\` or \`edit_file\` now — further discovery has diminishing returns.",
 						},
 					],
 					timestamp: Date.now(),
@@ -775,7 +1067,10 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			const steeringBatch = (await config.getSteeringMessages?.()) || [];
+			if (steeringBatch.length > 0) {
+				pendingMessages.push(...steeringBatch);
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
@@ -798,7 +1093,7 @@ async function runLoop(
 			);
 			const hint = uneditedTargets.length > 0
 				? `Unedited discovered files: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Read and edit them.`
-				: `Re-read the task acceptance criteria. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
+				: `Re-read the task acceptance criteria. If the task named exact old strings or labels, run \`grep_search\` (or \`run_terminal_cmd\` with \`grep -r\`) for any that remain. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
 			pendingMessages = [{
 				role: "user",
 				content: [{ type: "text", text: `REVIEW: You edited ${editedPaths.size} file(s): ${[...editedPaths].slice(0, 8).join(", ")}. ${hint}` }],
@@ -978,8 +1273,8 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ToolResultMessage[]> {
-	const results: ToolResultMessage[] = [];
-	const runnableCalls: PreparedToolCall[] = [];
+	/** One promise per tool call index — preserves assistant source order (immediate + prepared interleaved). */
+	const resultPromises: Promise<ToolResultMessage>[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -991,33 +1286,27 @@ async function executeToolCallsParallel(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
-			results.push(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit));
+			resultPromises.push(
+				Promise.resolve(await emitToolCallOutcome(toolCall, preparation.result, preparation.isError, emit)),
+			);
 		} else {
-			runnableCalls.push(preparation);
+			resultPromises.push(
+				executePreparedToolCall(preparation, signal, emit).then((executed) =>
+					finalizeExecutedToolCall(
+						currentContext,
+						assistantMessage,
+						preparation,
+						executed,
+						config,
+						signal,
+						emit,
+					),
+				),
+			);
 		}
 	}
 
-	const runningCalls = runnableCalls.map((prepared) => ({
-		prepared,
-		execution: executePreparedToolCall(prepared, signal, emit),
-	}));
-
-	for (const running of runningCalls) {
-		const executed = await running.execution;
-		results.push(
-			await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				running.prepared,
-				executed,
-				config,
-				signal,
-				emit,
-			),
-		);
-	}
-
-	return results;
+	return Promise.all(resultPromises);
 }
 
 type PreparedToolCall = {

@@ -317,28 +317,18 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			.filter(k => k.length >= 3 && k.length <= 80)
 			.filter(k => !/["']/.test(k))
 			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
-			.slice(0, 40);
-		if (filtered.length === 0 && paths.size === 0) {
-			const fallback: string[] = [];
-			appendMonorepoPackagesDiscovery(cwd, taskText, fallback);
-			if (fallback.length === 0) return "";
-			const criteriaCount = countAcceptanceCriteria(taskText);
-			const minDiscoveryCalls =
-				criteriaCount >= 3 ? 8 : criteriaCount >= 1 ? 6 : 4;
-			fallback.push(
-				`\nDiscovery floor: perform **at least ${minDiscoveryCalls} distinct discovery tool calls** (\`grep_search\`, \`file_search\`, \`codebase_search\`, \`list_dir\`) before the first edit.`,
-			);
-			return "\n\n" + fallback.join("\n") + "\n";
-		}
+			.slice(0, 20);
+		if (filtered.length === 0 && paths.size === 0) return "";
 
 		const fileHits = new Map<string, Set<string>>();
-		const includeGlobs = TASK_DISCOVERY_INCLUDE_PATTERNS.map((p) => `--include="${p}"`).join(" ");
+		const includeGlobs =
+			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.rs" --include="*.java" --include="*.kt" --include="*.scala" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp" --include="*.vue" --include="*.svelte" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.yaml" --include="*.yml" --include="*.toml" --include="*.md"';
 		for (const kw of filtered) {
 			try {
 				const escaped = shellEscape(kw);
 				const result = execSync(
-					`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -56`,
-					{ cwd, timeout: 4500, encoding: "utf-8", maxBuffer: 3 * 1024 * 1024 },
+					`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -12`,
+					{ cwd, timeout: 3000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
 				).trim();
 				if (result) {
 					for (const line of result.split("\n")) {
@@ -346,6 +336,29 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 						if (!file) continue;
 						if (!fileHits.has(file)) fileHits.set(file, new Set());
 						fileHits.get(file)!.add(kw);
+					}
+				}
+			} catch {}
+		}
+
+		// v139: search by FILENAME too (like cursor's glob)
+		const filenameHits = new Map<string, Set<string>>();
+		for (const kw of filtered) {
+			if (kw.includes("/") || kw.includes(" ") || kw.length > 40) continue;
+			try {
+				const nameResult = execSync(
+					`find . -type f -iname "*${shellEscape(kw)}*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*" -not -path "*/.next/*" | head -10`,
+					{ cwd, timeout: 2000, encoding: "utf-8", maxBuffer: 1024 * 1024 },
+				).trim();
+				if (nameResult) {
+					for (const line of nameResult.split("\n")) {
+						const file = line.trim().replace(/^\.\//, "");
+						if (!file) continue;
+						if (!filenameHits.has(file)) filenameHits.set(file, new Set());
+						filenameHits.get(file)!.add(kw);
+						// Also add to main fileHits
+						if (!fileHits.has(file)) fileHits.set(file, new Set());
+						fileHits.get(file)!.add(kw + " (filename)");
 					}
 				}
 			} catch {}
@@ -361,16 +374,47 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 
 		if (fileHits.size === 0 && literalPaths.length === 0) return "";
 
-		const sorted = [...fileHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 48);
+		const sorted = [...fileHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
 		const sections: string[] = [];
 
+		sections.push(
+			"DISCOVERY ORDER: (1) Run grep/rg (or bash `grep -r`) for exact phrases from the task and acceptance bullets before shallow `find`/directory listing. (2) Prefer the path that appears for multiple phrases. (3) Use find/ls only for gaps.",
+		);
+
 		if (literalPaths.length > 0) {
-			sections.push("FILES EXPLICITLY NAMED IN THE TASK (highest priority — start here):");
+			sections.push("\nFILES EXPLICITLY NAMED IN THE TASK (highest priority — start here):");
 			for (const p of literalPaths) sections.push(`- ${p}`);
 		}
-		if (sorted.length > 0) {
+
+		// Show filename matches separately (high priority)
+		const sortedFilename = [...filenameHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 8);
+		const shownFiles = new Set(literalPaths);
+		const newFilenameHits = sortedFilename.filter(([f]) => !shownFiles.has(f));
+		if (newFilenameHits.length > 0) {
+			sections.push("\nFILES MATCHING BY NAME (high priority — likely need edits):");
+			for (const [file, kws] of newFilenameHits) { sections.push(`- ${file} (name matches: ${[...kws].slice(0, 3).join(", ")})`); shownFiles.add(file); }
+		}
+
+		// Content hits excluding already shown
+		const contentOnly = sorted.filter(([f]) => !shownFiles.has(f));
+		if (contentOnly.length > 0) {
+			sections.push("\nFILES CONTAINING TASK KEYWORDS:");
+			for (const [file, kws] of contentOnly) sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
+		} else if (sorted.length > 0) {
 			sections.push("\nLIKELY RELEVANT FILES (ranked by task keyword matches):");
 			for (const [file, kws] of sorted) sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
+		}
+
+		if (sorted.length > 0) {
+			const top = sorted[0];
+			const second = sorted[1];
+			const topCount = top[1].size;
+			const secondCount = second ? second[1].size : 0;
+			if (topCount >= 3 && (second === undefined || topCount >= secondCount * 2)) {
+				sections.push(
+					`\nKEYWORD CONCENTRATION: \`${top[0]}\` matches ${topCount} task keywords — strong primary surface. Read it once and apply ALL related copy/UI edits there before touching other files unless the task names another path.`,
+				);
+			}
 		}
 
 		const topFile = literalPaths[0] || sorted[0]?.[0];
@@ -385,44 +429,31 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 		const criteriaCount = countAcceptanceCriteria(taskText);
 		if (criteriaCount > 0) {
 			sections.push(`\nThis task has ${criteriaCount} acceptance criteria.`);
+			const topMatches = sorted.length > 0 ? sorted[0][1].size : 0;
+			const secondMatches = sorted.length > 1 ? sorted[1][1].size : 0;
+			const concentrated =
+				sorted.length > 0 &&
+				topMatches >= 3 &&
+				(sorted.length === 1 || topMatches >= secondMatches * 2);
 			if (criteriaCount <= 2) {
+				sections.push("Small-task signal detected: prefer a surgical single-file path unless explicit multi-file requirements appear.");
+				sections.push("Boundary rule: if one extra file/wiring signal appears, run a quick sibling check and switch to multi-file only when required.");
+			} else if (concentrated) {
 				sections.push(
-					"Small-task signal: start from the primary file, but expand to other packages/files if imports, types, or criteria imply cross-file wiring (missing an implied file loses score).",
+					"Many criteria but keywords concentrate in one file (see KEYWORD CONCENTRATION): treat as a single primary file — apply every listed change there in one pass, then verify; only then open other files if something remains.",
 				);
-				sections.push(
-					"Boundary rule: if a sibling module, shared type, or second package is implicated, follow it — ‘surgical’ means no unrelated refactors, not a single-file limit.",
-				);
+			} else if (criteriaCount >= 3) {
+				sections.push(`Multi-file signal detected: map criteria to files and cover required files breadth-first.`);
 			}
-			if (criteriaCount >= 3) sections.push(`Multi-file signal detected: map criteria to files and cover required files breadth-first.`);
 		}
-		const minDiscoveryCalls =
-			criteriaCount >= 3 ? 8 : criteriaCount >= 1 ? 6 : 4;
-		sections.push(
-			`\nDiscovery floor: perform **at least ${minDiscoveryCalls} distinct discovery tool calls** (\`grep_search\`, \`file_search\`, \`codebase_search\`, \`list_dir\` — not \`read_file\`) before the first edit, unless every target path is explicitly listed in the task. With **3+** acceptance bullets, **8+** calls is the norm — more when the task spans UI, API, and tests.`,
-		);
-		sections.push(
-			"Thoroughness: use **different** \`codebase_search\` phrasings and **different** \`target_directories\`; run **several** \`grep_search\` literals from the task; \`list_dir\` top-level source folders you might touch. One broad semantic query is **not** sufficient.",
-		);
-		sections.push(
-			"If grep_search still shows identifiers from the task in files you have not opened, keep searching — stopping early often yields **zero** line overlap.",
-		);
+		sections.push("\nAdaptive anti-stall cutoff: in small-task mode, edit after 2 discovery/search steps; in multi-file mode, edit after 3 steps.");
 		const namedFiles = extractNamedFiles(taskText);
 		if (namedFiles.length > 0) {
 			sections.push(`\nFiles named in the task text: ${namedFiles.map(f => `\`${f}\``).join(", ")}.`);
-			sections.push(
-				"Named files are highest-priority: inspect first and **edit wherever** the task or criteria imply changes — do not skip a named path out of caution if it may be in scope.",
-			);
+			sections.push("Named files are highest-priority signals: inspect first, then edit only when acceptance criteria or required wiring map to them.");
 		}
 		sections.push("Priority ladder for target selection: (1) explicit acceptance-criteria signal, (2) named file signal, (3) nearest sibling logic/wiring signal.");
-		sections.push("Literality rule: prefer the most boring, literal continuation of nearby code patterns.");
-
-		const mechanical = buildMechanicalDiscoveryHints(taskText);
-		if (mechanical.length > 0) {
-			sections.push("\n**Mechanical discovery (do not skip — missing one file loses score):**");
-			sections.push(...mechanical);
-		}
-
-		appendMonorepoPackagesDiscovery(cwd, taskText, sections);
+		sections.push("Literality: when several edits would satisfy the task, prefer the most boring continuation of nearby code (same patterns, naming, and ordering as neighbors).");
 
 		return "\n\n" + sections.join("\n") + "\n";
 	} catch {}
@@ -437,28 +468,31 @@ const TAU_SCORING_PREAMBLE = `# Diff Overlap Optimizer
 Your score = number of your changed lines that also appear in a hidden reference diff.
 More matching lines = higher score. Extra lines beyond the reference do NOT reduce your score.
 
-## CRITICAL — Coverage protocol (non-optional)
+## Agent file-discovery protocol (mandatory reasoning sequence)
 
-Skipping this protocol is the dominant cause of **zero overlap** on whole files (tests, client pages, routes, etc.). You **must** run it on multi-criterion or multi-surface tasks before you treat discovery as finished.
+On any non-trivial task, follow this **ordered** sequence before treating discovery as complete. Skipping an earlier step because a later tool returned hits is a common failure mode.
 
-1. **Systematic \`grep_search\`:** Turn task literals into queries — distinctive symbols, strings, hook/API names, path fragments in backticks, and behaviors the criteria name (e.g. native dialogs, toasts, HTTP methods). Run \`grep_search\` for each important literal; open hits that plausibly implement part of a criterion.
-2. **Layered search:** Repeat discovery with different \`target_directories\` (e.g. app routes, client vs admin, \`lib\`, \`__tests__\`, API folders). One broad \`codebase_search\` is **not** enough; layer \`codebase_search\` + \`file_search\` + \`list_dir\` as needed.
-3. **Criterion-to-file checklist:** Build an explicit mapping — **each** acceptance bullet or named surface (client pages, manager UI, admin, API handlers, **test files** (including any the task asks you to add or update), **documentation** — README, CHANGELOG, \`docs/\`, guides, \`.md\` / \`.rst\`, etc.) → at least one target file you will \`read_file\` and edit. If a bullet names a surface and you have **no** file on the checklist for it, you are **not** done searching.
-4. **Documentation is in-scope work:** If the task asks to **update, add, or revise documentation** (any named path or generic “update the docs/README/changelog”), you **must** perform those edits. Do **not** treat docs as optional polish — skipping requested documentation fails the task the same way skipping code would.
-5. **Tests are in-scope work:** If the task asks to **update, add, or fix tests** (unit/integration/e2e, \`*.test.*\`, \`*.spec.*\`, \`__tests__/\`, snapshots, named test paths), you **must** edit those files. Skipping requested test updates fails the task the same way skipping implementation code would.
-6. **Increase coverage until planned:** Do not stop at the first “likely” file list. Expand coverage until **every** named or clearly implied surface has a **planned edit** (path chosen and tied to a criterion). Then proceed breadth-first across those files.
+1. **Parse → checklist:** From the task text and acceptance criteria, list concrete **obligations** (behavior, types, routes, UI, server, tests, docs). Each item must eventually map to **at least one** file you will \`read_file\` (or to a rare, explicit N/A).
 
-This protocol **overrides** the temptation to edit one area deeply while leaving other named surfaces untouched.
+2. **Harvest anchors:** Extract **search-grade** anchors — symbols, unique strings, HTTP paths, error messages, backticked paths, framework-specific names. Prose without anchors is not enough to prove coverage.
 
-## Breadth and thoroughness — search harder than feels necessary
+3. **Map layout (never guess paths):** \`list_dir\` from the workspace root, then each top-level source area the repo uses (\`src/\`, \`app/\`, \`packages/\`, \`lib/\`, test roots, \`docs/\`). In monorepos, list **each** package you might touch before assuming a folder exists.
 
-Default to **over-exploring** the repo before the first edit. Narrow search is the main failure mode.
+4. **Exact literal coverage — \`grep_search\`:** For **each** important anchor, run \`grep_search\` (literal or regex as appropriate). Use optional \`path\` for **per-subtree** sweeps. **Union** hit paths that could satisfy a criterion — “all files to edit” for symbol-level work usually means **every** in-scope path that still matches a forbidden pattern or that must implement a required pattern.
 
-- **Vary queries:** For each concept the task mentions, run **multiple** \`grep_search\` patterns (exact symbol, partial string, alternate spelling) and **multiple** \`codebase_search\` questions with **different wording** and/or \`target_directories\` — not one-and-done.
-- **Map the tree:** Use \`list_dir\` on the repo root and on each plausible top-level source area (\`src/\`, \`app/\`, \`packages/\`, \`lib/\`, test roots). Parallel folder trees (e.g. \`client\` vs \`admin\` vs \`api\`) are easy to miss if you never list them.
-- **Monorepos (\`packages/\`):** If a \`packages/\` directory exists, assume the task may require edits in **several** packages (UI dashboard + core/server/tools + shared utils). Search and map **each** relevant package — editing only \`packages/foo\` while leaving \`packages/bar\` untouched loses entire files in the reference diff.
-- **The injected file list is a hint, not a cap:** *LIKELY RELEVANT FILES* (if present) comes from partial keyword matching. **Critical files may be absent** from that list — you must still run your own layered searches until the coverage protocol is satisfied.
-- **Prefer extra discovery over early editing:** If unsure whether another subtree matters, **search it** (\`codebase_search\` scoped there, or \`grep_search\` with \`path\` / scope as your tools allow). Spurious searches are cheap; missed files are expensive.
+5. **Path-shaped clues — \`file_search\`:** For stems and fragments from the task or from imports you have seen, run \`file_search\`.
+
+6. **Behavior / wiring gaps — \`codebase_search\`:** When anchors are weak or you need “where / how / what”, run \`codebase_search\` with a **concrete** \`query\`, a one-sentence \`explanation\`, and **varied** \`target_directories\` (repo-wide **and** scoped). Treat output as **candidates** — confirm with \`read_file\` or \`grep_search\`.
+
+7. **Dependency trace:** From any confirmed file, follow **imports**, shared types, re-exports, sibling modules, API boundaries, and colocated tests/docs until cross-cutting checklist items have owners.
+
+8. **Closure (“all files”):** Re-\`grep_search\` for patterns the task must **eliminate** or **establish** repo-wide (or per subtree) until no in-scope file violates the criterion. If any checklist row still has **no** mapped file, discovery is **incomplete**.
+
+9. **Edit order:** **Breadth-first** — touch every checklist file (read + plan) before iterating deep fixes in a single file.
+
+10. **Edit safety (\`search_replace\` / \`edit_file\`):** Immediately before **each** \`search_replace\`, \`read_file\` that same file and build \`old_string\` **verbatim** from the **latest** output (never from memory or an older read). Use the **shortest** snippet that still matches **uniquely** once in the file (often 3–8 lines with local context); if the tool errors on 0 or multiple matches, re-read and narrow or widen \`old_string\` — **never** paste large duplicated blocks or merged fragments into \`old_string\`. For **large** TSX/JSX/React components (or any file where a single typo could duplicate half the tree), prefer \`edit_file\` with \`// ... existing code ...\` around **only** the changed region instead of a huge \`search_replace\`.
+
+This protocol is how you find **exact** locations and **all** files that matter.
 
 ## Hard constraints
 
@@ -470,10 +504,13 @@ Default to **over-exploring** the repo before the first edit. Narrow search is t
 - **MOST IMPORTANT**: Before committing to edits, **confirm coverage**: you ran scoped searches (\`target_directories\`) for each major subtree implied by the task and \`grep_search\` for key symbols — not only one broad codebase_search. Other files may be more relevant than the first hit list; if you only edit one module in a multi-criterion task, you likely missed files.
 - **MOST IMPORTANT**: After confirm coverage, read edit-needed files **fully** before editing. And then in the scope of ALL edit-needed files, make MINIMAL CHANGE strategies for edit. Minimal does **not** mean skipping a file or criterion; it means no unnecessary churn outside what the task requires.
 - **MOST IMPORTANT**: Before editing, LEARN the **styles and patterns** of each target file. Edits must look NATIVE to that file. CRITICAL: Style mismatch loses score VERY MUCH.
-- If unsure whether to edit or not to edit, search more before editing.
+- If unsure whether to edit or not to edit, search more before editing. And then if still unsure, just edit it.
+- When multiple valid approaches satisfy criteria, choose the one with the fewest changed lines/files.
+- Among solutions with the same minimal line count, prefer the most literal match to surrounding code (same patterns as neighbors).
 - Focus on **completing** every task criteria. CRITICAL: Missing any criterion loses score.
 - **Documentation:** When the task asks to update or add **documentation** (README, CHANGELOG, \`docs/\`, guides, \`.md\` / \`.rst\`, API docs, or any named doc path), you **must** edit those files. Treat doc updates as **required deliverables**, not optional follow-ups after code.
 - **Tests:** When the task asks to update, add, or fix **tests or specs** (any test layout: \`*.test.*\`, \`*.spec.*\`, \`__tests__/\`, e2e, snapshots), you **must** edit those files. Treat test updates as **required deliverables**, not optional after implementation.
+
 
 ## Style and edit discipline
 
@@ -485,13 +522,21 @@ Default to **over-exploring** the repo before the first edit. Narrow search is t
 - Do not refactor or fix unrelated issues outside the task scope.
 - NEW FILE RULE: before writing a new file, check what the existing files in the same directory export. Import and reuse them — write a thin wrapper, NEVER reimplement logic that already exists in neighboring modules.
 - When adding new code blocks to a file, base them on the closest existing example in that file — replicate its structure, naming, and patterns exactly.
-- **edit_file / overwrite trap:** Without \`// ... existing code ...\` placeholder lines, \`edit_file\` **replaces the entire file** with code_edit. A short snippet **wipes** large files (e.g. \`prisma/schema.prisma\`). Use \`search_replace\` with excerpts from \`read_file\`, or \`edit_file\` **with** placeholders around only the changed region.
+- **edit_file / overwrite trap:** Without \`// ... existing code ...\` placeholder lines, \`edit_file\` **replaces the entire file** with code_edit. A short snippet **wipes** large files (e.g. \`prisma/schema.prisma\`). Use \`search_replace\` with small excerpts from a **fresh** \`read_file\`, or \`edit_file\` **with** placeholders around only the changed region.
+- **Large React / JSX / TSX:** Prefer \`edit_file\` + \`// ... existing code ...\` for structural UI changes; reserve \`search_replace\` for **small** unique spans. That avoids duplicating JSX tails and corrupting the file when \`old_string\` is slightly wrong.
 - **Edit scope:** Build a **mental checklist** of paths to touch: named-in-task files + every path \`grep_search\` / \`codebase_search\` ties to a criterion (same symbol may appear under different route groups or packages). **Do not** edit DB schema files (\`prisma/schema.prisma\`, migrations) unless the task explicitly requires a schema change — prefer app/API code otherwise.
 - **Tool errors:** If any tool returns an error with a \`[R]\` recovery line, **read it literally** and retry with fixed arguments on the **next** turn — do not assume the edit applied.
 
+## Edit tool: exact match and failure recovery
+
+- **\`search_replace\` (tool):** By default \`old_string\` must match **exactly once**; 0 or multiple matches are **errors** (no silent fuzzy apply). Use \`allow_fuzzy_match: true\` only when quotes/whitespace truly differ from \`read_file\`; otherwise fix \`old_string\` after a fresh read. Use \`replace_all: true\` or \`replace_first_match_only: true\` only when you **intentionally** want every match or the first of several identical spans.
+- **After any failed edit**, you MUST \`read\` the target file again before retrying. Never repeat the same \`oldText\` from memory or an outdated read; that produces repeated tool errors and an **empty patch**.
+- Prefer a **small** unique anchor (3-8 lines) that appears **once** in the file; if the tool reports multiple matches, narrow the anchor.
+- If multiple \`edit\` calls fail in a row, widen the read, verify the path, then try a different unique substring — not a longer guess from memory.
+
 ## Final gate — do not finish before:
 
-- The **CRITICAL — Coverage protocol** was applied: systematic \`grep_search\`, layered \`target_directories\`, and a **criterion-to-file checklist** with a planned edit for every named surface (client pages, APIs, **tests if requested**, **documentation** if requested, etc.).
+- The **Agent file-discovery protocol** (numbered sequence: checklist → layout → grep → file_search → codebase_search for gaps → trace deps → closure) was executed; no step was skipped because another tool “already found something”.
 - **Breadth and thoroughness** satisfied: multiple query variants, \`list_dir\` where layout was unclear, and you did **not** treat the first hit list as complete.
 - Search was **layered** (not only the first codebase_search result): you considered symbols (\`grep_search\`), paths (\`file_search\`), and scoped directories as needed.
 - Every acceptance criterion has a corresponding change (or justified N/A if truly out of scope — rare).
@@ -502,156 +547,8 @@ Default to **over-exploring** the repo before the first edit. Narrow search is t
 
 ## Anti-stall (balance speed vs coverage)
 
-If the **CRITICAL — Coverage protocol**, **Breadth and thoroughness**, and **Discovery floor** (injected task section) are satisfied — i.e. you have a criterion-to-file checklist **and** you truly have no reasonable doubt about where edits live — implement **without** endless re-search. If you are **unsure** whether another file or subtree is in scope, run **one more** targeted search (\`codebase_search\` with a narrower \`target_directories\` or \`grep_search\` for a missing symbol) before editing. When in doubt, **search again**.
+If the **Agent file-discovery protocol** are satisfied — i.e. you have a criterion-to-file checklist **and** you truly have no reasonable doubt about where edits live — implement **without** endless re-search. If you are **unsure** whether another file or subtree is in scope, run **one more** targeted search (\`codebase_search\` with a narrower \`target_directories\` or \`grep_search\` for a missing symbol) before editing. When in doubt, **search again**.
 
-## How tool hints interact with coverage (read this before the sketches below)
-
-The commented tool sketches under **Tools Usage Guidelines** describe *typical* best uses for each tool. **They do not replace the coverage protocol.** For any non-trivial task you still **combine** tools: \`grep_search\` for **literals and symbols**, \`codebase_search\` for **behavior / “where how what” questions**, \`file_search\` for **path-shaped clues**, and \`list_dir\` to **see folder layout**. Skipping \`codebase_search\` because you ran \`grep_search\`, or the reverse, loses files — use **both**, with **different** queries and \`target_directories\`, until your checklist is complete.
-
-## Tools Usage Guidelines
-
-// codebase_search: semantic search that finds code by meaning, not exact text
-//
-// ### When to Use This Tool
-//
-// Use codebase_search when you need to:
-// - Explore unfamiliar codebases
-// - Ask "how / where / what" questions to understand behavior
-// - Find code by meaning rather than exact text
-//
-// ### When NOT to Use
-//
-// Prefer grep/file_search/read_file when those are clearly sufficient for ONE query.
-// Coverage exception: for task completion you STILL run codebase_search (multiple scopes/wordings)
-// alongside grep — see "How tool hints interact with coverage" above; do not treat this list as permission to skip semantic exploration.
-// 1. Exact text matches (use grep)
-// 2. Reading known files (use read_file)
-// 3. Simple symbol lookups (use grep)
-// 4. Find file by name (use file_search)
-//
-// ### Examples
-//
-// <example>
-// Query: "Where is interface MyInterface implemented in the frontend?"
-// <reasoning>
-// Good: Complete question asking about implementation location with specific context (frontend).
-// </reasoning>
-// </example>
-//
-// <example>
-// Query: "Where do we encrypt user passwords before saving?"
-// <reasoning>
-// Good: Clear question about a specific process with context about when it happens.
-// </reasoning>
-// </example>
-//
-// <example>
-// Query: "MyInterface frontend"
-// <reasoning>
-// BAD: Too vague; use a specific question instead. This would be better as "Where is MyInterface used in the frontend?"
-// </reasoning>
-// </example>
-//
-// <example>
-// Query: "AuthService"
-// <reasoning>
-// BAD: Single word searches should use grep for exact text matching instead.
-// </reasoning>
-// </example>
-//
-// <example>
-// Query: "What is AuthService? How does AuthService work?"
-// <reasoning>
-// BAD: Combines two separate queries. A single semantic search is not good at looking for multiple things in parallel. Split into separate parallel searches: like "What is AuthService?" and "How does AuthService work?"
-// </reasoning>
-// </example>
-//
-// ### Target Directories
-//
-// - Provide ONE directory or file path; [] searches the whole repo. No globs or wildcards.
-// Good:
-// - ["backend/api/"]   - focus directory
-// - ["src/components/Button.tsx"] - single file
-// - [] - search everywhere when unsure
-// BAD:
-// - ["frontend/", "backend/"] - multiple paths
-// - ["src/**/utils/**"] - globs
-// - ["*.ts"] or ["**/*"] - wildcard paths
-//
-// ### Search Strategy
-//
-// 1. Start with exploratory queries - semantic search is powerful and often finds relevant context in one go. Begin broad with [] if you're not sure where relevant code is.
-// 2. Review results; if a directory or file stands out, rerun with that as the target.
-// 3. Break large questions into smaller ones (e.g. auth roles vs session storage).
-// 4. For big files (>1K lines) run codebase_search, or grep if you know the exact symbols you're looking for, scoped to that file instead of reading the entire file.
-//
-// <example>
-// Step 1: { "query": "How does user authentication work?", "target_directories": [], "explanation": "Find auth flow" }
-// Step 2: Suppose results point to backend/auth/ → rerun:
-// { "query": "Where are user roles checked?", "target_directories": ["backend/auth/"], "explanation": "Find role logic" }
-// <reasoning>
-// Good strategy: Start broad to understand overall system, then narrow down to specific areas based on initial results.
-// </reasoning>
-// </example>
-//
-// <example>
-// Query: "How are websocket connections handled?"
-// Target: ["backend/services/realtime.ts"]
-// <reasoning>
-// Good: We know the answer is in this specific file, but the file is too large to read entirely, so we use semantic search to find the relevant parts.
-// </reasoning>
-// </example>
-//
-// ### Usage
-// - When full chunk contents are provided, avoid re-reading the exact same chunk contents using the read_file tool.
-// - Sometimes, just the chunk signatures and not the full chunks will be shown. Chunk signatures are usually Class or Function signatures that chunks are contained in. Use the read_file or grep tools to explore these chunks or files if you think they might be relevant.
-// - When reading chunks that weren't provided as full chunks (e.g. only as line ranges or signatures), you'll sometimes want to expand the chunk ranges to include the start of the file to see imports, expand the range to include lines from the signature, or expand the range to read multiple chunks from a file at once.
-type codebase_search = (_: {
-// One sentence explanation as to why this tool is being used, and how it contributes to the goal.
-explanation: string,
-// A complete question about what you want to understand. Ask as if talking to a colleague: 'How does X work?', 'What happens when Y?', 'Where is Z handled?'
-query: string,
-// Prefix directory paths to limit search scope (single directory only, no glob patterns)
-target_directories: string[],
-}) => any;
-
-// Use this tool to edit a jupyter notebook cell. Use ONLY this tool to edit notebooks.
-//
-// This tool supports editing existing cells and creating new cells:
-// - If you need to edit an existing cell, set 'is_new_cell' to false and provide the 'old_string' and 'new_string'.
-// -- The tool will replace ONE occurrence of 'old_string' with 'new_string' in the specified cell.
-// - If you need to create a new cell, set 'is_new_cell' to true and provide the 'new_string' (and keep 'old_string' empty).
-// - It's critical that you set the 'is_new_cell' flag correctly!
-// - This tool does NOT support cell deletion, but you can delete the content of a cell by passing an empty string as the 'new_string'.
-//
-// Other requirements:
-// - Cell indices are 0-based.
-// - 'old_string' and 'new_string' should be a valid cell content, i.e. WITHOUT any JSON syntax that notebook files use under the hood.
-// - The old_string MUST uniquely identify the specific instance you want to change. This means:
-// -- Include AT LEAST 3-5 lines of context BEFORE the change point
-// -- Include AT LEAST 3-5 lines of context AFTER the change point
-// - This tool can only change ONE instance at a time. If you need to change multiple instances:
-// -- Make separate calls to this tool for each instance
-// -- Each call must uniquely identify its specific instance using extensive context
-// - This tool might save markdown cells as "raw" cells. Don't try to change it, it's fine. We need it to properly display the diff.
-// - If you need to create a new notebook, just set 'is_new_cell' to true and cell_idx to 0.
-// - ALWAYS generate arguments in the following order: target_notebook, cell_idx, is_new_cell, cell_language, old_string, new_string.
-// - Prefer editing existing cells over creating new ones!
-// - ALWAYS provide ALL required arguments (including BOTH old_string and new_string). NEVER call this tool without providing 'new_string'.
-type edit_notebook = (_: {
-// The path to the notebook file you want to edit. You can use either a relative path in the workspace or an absolute path. If an absolute path is provided, it will be preserved as is.
-target_notebook: string,
-// The index of the cell to edit (0-based)
-cell_idx: number,
-// If true, a new cell will be created at the specified cell index. If false, the cell at the specified cell index will be edited.
-is_new_cell: boolean,
-// The language of the cell to edit. Should be STRICTLY one of these: 'python', 'markdown', 'javascript', 'typescript', 'r', 'sql', 'shell', 'raw' or 'other'.
-cell_language: string,
-// The text to replace (must be unique within the cell, and must match the cell contents exactly, including all whitespace and indentation).
-old_string: string,
-// The edited text to replace the old_string or the content for the new cell.
-new_string: string,
-}) => any;
 ---
 
 `;
@@ -679,7 +576,7 @@ Execute **before the first edit**. Treat this as a **checklist**, not a single s
 
 7. **Gate:** Start \`search_replace\` / \`edit_file\` only when (1)–(6) leave no **obvious** uncovered area; if uncertain, run **one more** targeted search first.
 
-**Edits:** Minimal diffs; no unrelated refactors. Prefer \`read_file\` then \`search_replace\` or \`edit_file\` with \`// ... existing code ...\` anchors. Avoid editing generated artifacts, lockfiles, or schema/migrations unless the task requires it. If the task names or implies **documentation** updates, include those files in your edit plan and **complete** them — same priority as code. If the task names or implies **test/spec** updates, include those files and **complete** them — same priority as production code. If a tool returns an error with a \`[R]\` line, fix arguments and **retry** next turn.
+**Edits:** Minimal diffs; no unrelated refactors. **Before each \`search_replace\`:** \`read_file\` that file in the same turn (or immediately prior) and copy a **small** unique \`old_string\` verbatim; for big TSX/JSX files prefer \`edit_file\` with \`// ... existing code ...\`. Prefer \`read_file\` then \`search_replace\` or \`edit_file\` with placeholders. Avoid editing generated artifacts, lockfiles, or schema/migrations unless the task requires it. If the task names or implies **documentation** updates, include those files in your edit plan and **complete** them — same priority as code. If the task names or implies **test/spec** updates, include those files and **complete** them — same priority as production code. If a tool returns an error with a \`[R]\` line, fix arguments and **retry** next turn.
 `;
 
 /** Extra hints when the active model is Google Gemini (argument shape + reliability). */
@@ -688,6 +585,10 @@ const GEMINI_MODEL_DISCOVERY_ADDENDUM = `
 ## Gemini — tool argument reliability
 
 Pass tool parameters as a **flat JSON object** with the **exact** schema field names. Avoid nesting the entire payload under \`input\` / \`args\` when a flat object is possible — unwrapping is best-effort. If a tool errors, read the message (including any \`[R]\` recovery hint), correct arguments, and **retry**; do not assume success without a successful tool result.
+
+## Gemini — discovery
+
+Follow the main prompt’s **Agent file-discovery protocol** (10-step sequence): checklist and anchors first, \`list_dir\` before guessing paths, exhaustive \`grep_search\` for literals, \`codebase_search\` only for wiring gaps with varied scopes, then dependency trace and closure before editing.
 `;
 
 export interface BuildSystemPromptOptions {

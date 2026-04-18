@@ -37,6 +37,25 @@ If the repo has **`packages/`** (monorepo), the injected block may include **MON
 
 ---
 
+## Agent file-discovery protocol (same as system prompt)
+
+For **exact** locations and **all** files that matter, the harness prompt defines a **10-step mandatory sequence** in `packages/coding-agent/src/core/system-prompt.ts` under **`## Agent file-discovery protocol (mandatory reasoning sequence)`**:
+
+1. Parse the task → **criterion checklist** (every bullet maps to a file or N/A).  
+2. **Harvest anchors** (symbols, strings, paths) for search.  
+3. **`list_dir`** layout — never invent folders.  
+4. **`grep_search`** every anchor; union hits; use `path` for subtree sweeps.  
+5. **`file_search`** for path fragments.  
+6. **`codebase_search`** for wiring gaps only — concrete query + explanation + varied `target_directories`; candidates must be confirmed.  
+7. **Trace dependencies** (imports, types, tests, docs).  
+8. **Closure** — re-grep until task-required patterns are satisfied everywhere in scope.  
+9. **Breadth-first edits** across checklist files.  
+10. **`read_file`** immediately before each `search_replace` for verbatim `old_string`.
+
+The **Final gate** requires this protocol to be satisfied, not only a single successful search.
+
+---
+
 ## Harness tool mapping
 
 Do not assume generic `edit` / `oldText` APIs. This stack uses at least:
@@ -57,6 +76,7 @@ Do not assume generic `edit` / `oldText` APIs. This stack uses at least:
 
 ## What to do (defer to system prompt for detail)
 
+- **Agent file-discovery protocol** (above): 10-step ordered sequence (checklist → layout → grep → file_search → codebase_search → trace → closure → breadth-first → safe replace).
 - **CRITICAL — Coverage protocol** (above): systematic grep + layered search + criterion-to-file checklist; non-optional for multi-surface tasks.
 - **Breadth:** Same file — search **more broadly than feels necessary**; multiple phrasings, `list_dir`, repo-wide `codebase_search` when layout is still unclear.
 - **Discovery:** Hard constraints + **Discovery floor** + **Final gate** in `system-prompt.ts` — multiple tool types, scoped passes, `grep_search` for task literals until coverage is credible.

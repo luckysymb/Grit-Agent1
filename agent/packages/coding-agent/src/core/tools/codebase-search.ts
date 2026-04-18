@@ -1,6 +1,7 @@
 /**
  * Cursor-style "codebase_search": keyword / ripgrep–based exploration over the repo.
- * Runs 5 refinement rounds: ripgrep → read top-10 hit files → NLP keyword augmentation (loyal to query+explanation) → repeat.
+ * Runs SEARCH_ROUNDS passes: ripgrep (OR of fixed-string keywords) → read top hit files → NLP keyword augmentation → repeat.
+ * Not a vector embedding index — results are keyword-hit counts + heuristics.
  */
 
 import { spawn } from "node:child_process";
